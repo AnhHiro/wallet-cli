@@ -13,6 +13,9 @@ export function formatScalar(v: unknown): string {
 }
 
 export function formatInt(v: unknown): string {
+  if (typeof v === "string" && /^-?\d+$/.test(v)) {
+    return formatDecimal(v);
+  }
   const n = Number(v);
   return Number.isFinite(n) ? Math.trunc(n).toLocaleString("en-US") : String(v ?? "");
 }
@@ -28,7 +31,9 @@ export function formatDecimal(v: unknown): string {
 
 export function formatUsd(v: unknown): string {
   const n = Number(v);
-  return Number.isFinite(n) ? n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(v ?? "");
+  return Number.isFinite(n)
+    ? n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    : String(v ?? "");
 }
 
 export function formatSun(v: unknown): string {
@@ -57,9 +62,12 @@ export function formatAtWithRelative(v: unknown, now: number = Date.now()): stri
   const at = `${date} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
   const delta = n - now;
   const mag = Math.abs(delta);
-  const unit = mag >= 86_400_000
-    ? `${Math.round(mag / 86_400_000)} day(s)`
-    : mag >= 3_600_000 ? `${Math.round(mag / 3_600_000)}h` : `${Math.max(1, Math.round(mag / 60_000))}m`;
+  const unit =
+    mag >= 86_400_000
+      ? `${Math.round(mag / 86_400_000)} day(s)`
+      : mag >= 3_600_000
+        ? `${Math.round(mag / 3_600_000)}h`
+        : `${Math.max(1, Math.round(mag / 60_000))}m`;
   return `${at} (${delta >= 0 ? `in ~${unit}` : `~${unit} ago`})`;
 }
 
@@ -95,7 +103,24 @@ export function methodName(sig: string): string {
 // Built via RegExp so the source file itself carries no raw control bytes.
 const CONTROL_BYTES = new RegExp("[\\u0000-\\u0009\\u000B-\\u001F\\u007F-\\u009F]", "g");
 
+// Bidi and other invisible formatting characters are NOT control bytes — they pass straight through
+// the strip above — and for a security display they are the more dangerous half. U+202E reverses
+// the visible order of everything after it, so a chain-controlled permission name can make the
+// address or weight printed beside it read as something else; the zero-width characters can make
+// two different names look identical. These are MARKED rather than dropped: dropping them would
+// silently mangle legitimate right-to-left text, whereas an escape keeps the string honest and
+// makes tampering obvious. Built via RegExp so this file carries no raw formatting characters.
+const INVISIBLE_FORMATTING = new RegExp(
+  "[\\u061C\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2064\\u2066-\\u2069\\uFEFF]",
+  "g",
+);
+
 /** strip terminal control bytes from a text-mode output frame (never applied in JSON mode). */
 export function sanitizeText(s: string): string {
-  return s.replace(CONTROL_BYTES, "");
+  return s
+    .replace(CONTROL_BYTES, "")
+    .replace(
+      INVISIBLE_FORMATTING,
+      (c) => `<U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>`,
+    );
 }

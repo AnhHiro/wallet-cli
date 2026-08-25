@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AtomicFileStore } from "./index.js";
@@ -111,11 +118,14 @@ describe("AtomicFileStore.writeJsonAll", () => {
     writeFileSync(a, '"old-A"\n');
 
     const store = new AtomicFileStore();
-    store.fsyncDir = () => { throw EIO(); }; // the post-commit durability barrier fails
+    store.fsyncDir = () => {
+      throw EIO();
+    }; // the post-commit durability barrier fails
 
     // the commit already succeeded, so this must NOT be masked as a clean rollback
-    expect(() => store.writeJsonAll([{ path: a, value: "new-A" }]))
-      .toThrowError(expect.objectContaining({ code: "io_error" }));
+    expect(() => store.writeJsonAll([{ path: a, value: "new-A" }])).toThrowError(
+      expect.objectContaining({ code: "io_error" }),
+    );
 
     // new blob is installed and readable — the state was NOT reverted
     expect(JSON.parse(readFileSync(a, "utf8"))).toBe("new-A");
@@ -162,7 +172,9 @@ describe("AtomicFileStore.writeJsonAll", () => {
     writeFileSync(b, '"old-B"\n');
 
     const store = new AtomicFileStore();
-    store.fsyncDir = () => { throw EIO(); }; // durability barrier fails on the rollback path too
+    store.fsyncDir = () => {
+      throw EIO();
+    }; // durability barrier fails on the rollback path too
     let installs = 0;
     store.commitRename = (from: string, to: string) => {
       if (from.includes(".tmp")) {
@@ -205,13 +217,67 @@ describe("AtomicFileStore.writeJsonAll", () => {
 describe("AtomicFileStore.fsyncDir", () => {
   it("propagates a real I/O error instead of silently reporting a durable write", () => {
     const store = new AtomicFileStore();
-    store.rawFsyncDir = () => { throw EIO(); };
-    expect(() => store.fsyncDir("/anything")).toThrowError(expect.objectContaining({ code: "EIO" }));
+    store.rawFsyncDir = () => {
+      throw EIO();
+    };
+    expect(() => store.fsyncDir("/anything")).toThrowError(
+      expect.objectContaining({ code: "EIO" }),
+    );
   });
 
   it("swallows an unsupported-directory-fsync error (best-effort)", () => {
     const store = new AtomicFileStore();
-    store.rawFsyncDir = () => { throw Object.assign(new Error("EINVAL"), { code: "EINVAL" }); };
+    store.rawFsyncDir = () => {
+      throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+    };
     expect(() => store.fsyncDir("/anything")).not.toThrow();
+  });
+});
+
+describe("AtomicFileStore I/O error mapping", () => {
+  const ENOSPC = () => {
+    throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+  };
+
+  it("writeJson reports io_error, preserves the target, and removes its temp", () => {
+    const root = mkdtempSync(join(tmpdir(), "fs-enospc-json-"));
+    const target = join(root, "data.json");
+    writeFileSync(target, '"old"\n');
+    const store = new AtomicFileStore();
+    store.fsyncFile = ENOSPC;
+
+    expect(() => store.writeJson(target, "new")).toThrowError(
+      expect.objectContaining({ code: "io_error" }),
+    );
+    expect(readFileSync(target, "utf8")).toBe('"old"\n');
+    expect(readdirSync(root)).toEqual(["data.json"]);
+  });
+
+  it("writeText reports io_error, preserves the target, and removes its temp", () => {
+    const root = mkdtempSync(join(tmpdir(), "fs-enospc-text-"));
+    const target = join(root, "config.yaml");
+    writeFileSync(target, "old\n");
+    const store = new AtomicFileStore();
+    store.fsyncFile = ENOSPC;
+
+    expect(() => store.writeText(target, "new\n")).toThrowError(
+      expect.objectContaining({ code: "io_error" }),
+    );
+    expect(readFileSync(target, "utf8")).toBe("old\n");
+    expect(readdirSync(root)).toEqual(["config.yaml"]);
+  });
+
+  it("writeJsonAll maps a cleanly rolled-back ENOSPC to io_error", () => {
+    const root = mkdtempSync(join(tmpdir(), "fs-enospc-all-"));
+    const target = join(root, "wallets.json");
+    writeFileSync(target, '"old"\n');
+    const store = new AtomicFileStore();
+    store.fsyncFile = ENOSPC;
+
+    expect(() => store.writeJsonAll([{ path: target, value: "new" }])).toThrowError(
+      expect.objectContaining({ code: "io_error" }),
+    );
+    expect(readFileSync(target, "utf8")).toBe('"old"\n');
+    expect(readdirSync(root)).toEqual(["wallets.json"]);
   });
 });

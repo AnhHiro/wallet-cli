@@ -3,7 +3,19 @@
  * Writes go to a temp file then rename into place; concurrent processes coordinate
  * via an O_EXCL lockfile so they don't clobber each other (wallets.json/config.yaml).
  */
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import { ExecutionError } from "../../../../domain/errors/index.js";
@@ -51,12 +63,7 @@ export class AtomicFileStore {
   }
 
   writeJson(path: string, value: unknown): void {
-    mkdirSync(dirname(path), { recursive: true });
-    const tmp = `${path}.${process.pid}.${this.#counter++}.tmp`;
-    writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", { mode: 0o600 });
-    this.fsyncFile(tmp); // durably land the content before the rename that publishes it
-    renameSync(tmp, path); // atomic replace on same filesystem
-    this.fsyncDir(dirname(path)); // durably land the rename (the directory entry)
+    this.writeText(path, JSON.stringify(value, null, 2) + "\n");
   }
 
   /** transactional multi-file write: stage every temp first, then commit each into place while
@@ -75,8 +82,14 @@ export class AtomicFileStore {
         this.fsyncFile(tmp); // land every staged blob before any commit rename runs
       }
     } catch (e) {
-      for (const { tmp } of staged) { try { unlinkSync(tmp); } catch { /* best-effort */ } }
-      throw e;
+      for (const { tmp } of staged) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* best-effort */
+        }
+      }
+      throwIoError(e, "could not stage atomic JSON write");
     }
 
     // commit phase: back up each existing target, then move its temp into place.
@@ -87,7 +100,11 @@ export class AtomicFileStore {
         // from a prior crashed run, so the commit never overwrites an existing recovery copy.
         const bak = existsSync(path) ? `${path}.${randomBytes(16).toString("hex")}.bak` : null;
         if (bak) {
-          if (existsSync(bak)) throw new ExecutionError("io_error", `backup path already exists, refusing to overwrite: ${bak}`);
+          if (existsSync(bak))
+            throw new ExecutionError(
+              "io_error",
+              `backup path already exists, refusing to overwrite: ${bak}`,
+            );
           this.commitRename(path, bak); // set aside the old blob
         }
         committed.push({ path, bak }); // record BEFORE the tmp rename so restore covers this file
@@ -97,11 +114,26 @@ export class AtomicFileStore {
       let restoreFailed = false;
       for (const { path, bak } of committed.reverse()) {
         try {
-          if (bak) this.commitRename(bak, path); // put the old blob back (replaces new if present)
-          else { try { unlinkSync(path); } catch { /* ignore */ } } // was a newly created file
-        } catch { restoreFailed = true; }
+          if (bak)
+            this.commitRename(bak, path); // put the old blob back (replaces new if present)
+          else {
+            try {
+              unlinkSync(path);
+            } catch {
+              /* ignore */
+            }
+          } // was a newly created file
+        } catch {
+          restoreFailed = true;
+        }
       }
-      for (const { tmp } of staged) { try { unlinkSync(tmp); } catch { /* best-effort */ } }
+      for (const { tmp } of staged) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* best-effort */
+        }
+      }
       if (restoreFailed) {
         throw new ExecutionError(
           "io_error",
@@ -120,10 +152,14 @@ export class AtomicFileStore {
         throw new ExecutionError(
           "io_error",
           "keystore write failed and was rolled back, but the rollback's durability could not be confirmed; the prior state is in effect — verify and retry.",
-          { error: String(e), fsyncError: String(fsyncErr), files: committed.map((c) => c.path).join(", ") },
+          {
+            error: String(e),
+            fsyncError: String(fsyncErr),
+            files: committed.map((c) => c.path).join(", "),
+          },
         );
       }
-      throw e; // clean rollback: every target restored to its prior state
+      throwIoError(e, "atomic JSON write failed and was rolled back");
     }
     // durably land every committed rename before reporting success (still not multi-file atomic —
     // that needs the journal in CP-01 — but each installed blob now survives power loss).
@@ -140,7 +176,15 @@ export class AtomicFileStore {
         { error: String(e), files: committed.map((c) => c.path).join(", ") },
       );
     }
-    for (const { bak } of committed) { if (bak) { try { unlinkSync(bak); } catch { /* ignore */ } } }
+    for (const { bak } of committed) {
+      if (bak) {
+        try {
+          unlinkSync(bak);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
   }
 
   /** rename seam used by the commit/restore phase of writeJsonAll — overridable in tests to
@@ -152,13 +196,21 @@ export class AtomicFileStore {
   /** fsync a file's bytes to stable storage. Separate seam so tests can observe the barrier. */
   fsyncFile(path: string): void {
     const fd = openSync(path, "r");
-    try { fsyncSync(fd); } finally { closeSync(fd); }
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   /** raw directory fsync syscall — overridable seam so tests can inject a failure. */
   rawFsyncDir(dir: string): void {
     const fd = openSync(dir, "r");
-    try { fsyncSync(fd); } finally { closeSync(fd); }
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
   }
 
   /** fsync a directory so a rename into it survives power loss. Skipped on platforms that can't
@@ -172,18 +224,37 @@ export class AtomicFileStore {
       // some POSIX filesystems (FAT, network/FUSE mounts) reject fsync on a directory fd — tolerate
       // only those "not applicable" codes; EIO/ENOSPC/EACCES/EBADF stay real faults and propagate.
       const code = (e as NodeJS.ErrnoException)?.code;
-      if (code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS") return;
+      if (code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS")
+        return;
       throw e;
     }
   }
 
   writeText(path: string, text: string): void {
-    mkdirSync(dirname(path), { recursive: true });
     const tmp = `${path}.${process.pid}.${this.#counter++}.tmp`;
-    writeFileSync(tmp, text, { mode: 0o600 });
-    this.fsyncFile(tmp);
-    renameSync(tmp, path);
-    this.fsyncDir(dirname(path));
+    let published = false;
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(tmp, text, { mode: 0o600 });
+      this.fsyncFile(tmp);
+      renameSync(tmp, path);
+      published = true;
+      this.fsyncDir(dirname(path));
+    } catch (error) {
+      if (!published) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* best-effort */
+        }
+      }
+      throwIoError(
+        error,
+        published
+          ? "atomic text write committed but durability could not be confirmed"
+          : "could not complete atomic text write",
+      );
+    }
   }
 
   withLock<T>(path: string, fn: () => T, opts: { timeoutMs?: number; staleMs?: number } = {}): T {
@@ -198,7 +269,11 @@ export class AtomicFileStore {
       } catch (e) {
         if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
         if (isStaleLock(lock, staleMs)) {
-          try { unlinkSync(lock); } catch { /* someone else won the steal */ }
+          try {
+            unlinkSync(lock);
+          } catch {
+            /* someone else won the steal */
+          }
           continue;
         }
         if (Date.now() > deadline) {
@@ -221,4 +296,13 @@ export class AtomicFileStore {
   }
 
   #counter = 0;
+}
+
+function throwIoError(error: unknown, message: string): never {
+  if (error instanceof ExecutionError) throw error;
+  const code = (error as NodeJS.ErrnoException)?.code;
+  if (typeof code === "string") {
+    throw new ExecutionError("io_error", message, { code });
+  }
+  throw error;
 }

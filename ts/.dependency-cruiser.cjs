@@ -30,7 +30,8 @@ module.exports = {
     {
       name: "inbound-does-not-know-outbound",
       severity: "error",
-      comment: "CLI adapters call application ports/use-cases; bootstrap/composition supplies outbound implementations",
+      comment:
+        "CLI adapters call application ports/use-cases; bootstrap/composition supplies outbound implementations",
       from: { path: "^src/adapters/inbound/", pathNot: "\\.test\\.ts$" },
       to: { path: "^src/(adapters/outbound|bootstrap)/" },
     },
@@ -45,5 +46,10 @@ module.exports = {
     doNotFollow: { path: "node_modules" },
     tsConfig: { fileName: "tsconfig.json" },
     enhancedResolveOptions: { extensions: [".ts", ".js"] },
+    // `import type` is erased at build time, so without this the rules above only see the graph
+    // that survives compilation — and a boundary violation carrying only a type is still one: it
+    // names a concrete implementation where a port belongs, and it is what a later refactor turns
+    // into a runtime edge.
+    tsPreCompilationDeps: true,
   },
 };

@@ -20,6 +20,26 @@ export interface TypedDataSignature {
   primaryType: string;
 }
 
+/** Lossless JSON projection of one complete TRON protocol.Transaction artifact. */
+export interface TronTransactionArtifact {
+  visible?: boolean;
+  txID: string;
+  raw_data: {
+    contract: Array<{
+      type: string;
+      Permission_id?: number;
+      parameter?: { value?: Record<string, unknown>; type_url?: string };
+      [key: string]: unknown;
+    }>;
+    expiration?: number;
+    timestamp?: number;
+    [key: string]: unknown;
+  };
+  raw_data_hex: string;
+  signature?: string[];
+  [key: string]: unknown;
+}
+
 export interface BroadcastResult {
   txId?: string;
   hash?: string;
@@ -32,8 +52,16 @@ export type BroadcastStage = "submitted" | "confirmed" | "failed";
 
 export type TxOutcome =
   | { stage: "plan"; tx: UnsignedTx; fee: FeeReport }
+  | { stage: "built"; tx: UnsignedTx; hex: string; fee: FeeReport }
   // `fee` is absent when the caller supplied the transaction (tx sign): nothing was estimated.
-  | { stage: "signed"; signed: SignedTx; fee?: FeeReport; address?: string; txId?: string }
+  | {
+      stage: "signed";
+      signed: SignedTx;
+      hex?: string;
+      fee?: FeeReport;
+      address?: string;
+      txId?: string;
+    }
   | ({ stage: BroadcastStage } & BroadcastResult);
 
 // ════════════════════ per-command typed text outputs ══════════════════════
@@ -59,15 +87,50 @@ export interface TxStatusView {
 }
 
 /** decoded transfer parties of a tx (best-effort from the raw tx). */
-export interface TxParties { from?: string; to?: string; amount?: string; symbol?: string; contract?: string }
+export interface TxParties {
+  from?: string;
+  to?: string;
+  amount?: string;
+  symbol?: string;
+  contract?: string;
+}
 
 /** which action a broadcast receipt describes — drives the summary verb + extra rows.
  *  A typed discriminant replaces matching on the stringly command id. */
 export type TxReceiptKind =
-  | "send" | "broadcast" | "sign"
-  | "stake-freeze" | "stake-unfreeze" | "stake-delegate" | "stake-undelegate" | "stake-withdraw" | "stake-cancel"
-  | "contract-send" | "contract-deploy"
-  | "vote-cast" | "reward-withdraw";
+  | "send"
+  | "broadcast"
+  | "sign"
+  | "stake-freeze"
+  | "stake-unfreeze"
+  | "stake-delegate"
+  | "stake-undelegate"
+  | "stake-withdraw"
+  | "stake-cancel"
+  | "contract-send"
+  | "contract-deploy"
+  | "proposal-create"
+  | "proposal-approve"
+  | "proposal-delete"
+  | "witness-create"
+  | "witness-update"
+  | "witness-set-brokerage"
+  | "contract-clear-abi"
+  | "contract-set-origin-energy-limit"
+  | "contract-set-user-resource-percent"
+  | "vote-cast"
+  | "reward-withdraw"
+  | "permission-update"
+  | "account-activate"
+  | "account-set"
+  | "asset-issue"
+  | "asset-update"
+  | "asset-participate"
+  | "asset-unfreeze"
+  | "exchange-create"
+  | "exchange-inject"
+  | "exchange-withdraw"
+  | "exchange-trade";
 
 /**
  * Canonical tx receipt the signing commands return (dry-run / sign-only / broadcast stages).
@@ -77,16 +140,22 @@ export type TxReceiptKind =
  */
 export interface TxReceiptView {
   kind: TxReceiptKind;
-  mode?: "dry-run" | "sign-only";
+  mode?: "dry-run" | "build-only" | "sign-only";
   stage?: BroadcastStage;
   txId?: string;
   hash?: string;
   // plan / sign-only
   /** address that produced the signature (sign-only outcomes). */
   address?: string;
+  payer?: string;
+  field?: "name" | "id";
+  value?: string;
   fee?: FeeReport;
   tx?: UnsignedTx;
   signed?: SignedTx;
+  hex?: string;
+  transaction?: import("./multisig.js").TxApprovalView;
+  multiSignFeeSun?: number;
   // transfer / stake inputs
   rawAmount?: string;
   amountSun?: string | number;
@@ -95,6 +164,7 @@ export interface TxReceiptView {
   assetId?: string;
   decimals?: number;
   to?: string;
+  toContact?: string;
   receiver?: string;
   resource?: string;
   votes?: Array<{ witness: string; count: number }>;
@@ -103,6 +173,60 @@ export interface TxReceiptView {
   // contract
   method?: string;
   contractAddress?: string;
+  // TRC10 assets — quantities in the asset's minimal units, rendered with `precision`
+  name?: string;
+  abbr?: string;
+  issuerAddress?: string;
+  participantAddress?: string;
+  precision?: number;
+  totalSupply?: string;
+  price?: string;
+  trxNum?: number;
+  num?: number;
+  startTime?: number;
+  endTime?: number;
+  url?: string;
+  description?: string;
+  freeAssetNetLimit?: number;
+  publicFreeAssetNetLimit?: number;
+  frozenSupply?: Array<{ amount: string; days: number }>;
+  paidSun?: string;
+  receivedAmount?: string;
+  // Bancor exchange — quantities in each token's minimal units, rendered with its own decimals
+  exchangeId?: number;
+  pair?: string;
+  creatorAddress?: string;
+  traderAddress?: string;
+  firstTokenId?: string;
+  firstTokenQuant?: string;
+  firstTokenLabel?: string;
+  firstTokenDecimals?: number;
+  secondTokenId?: string;
+  secondTokenQuant?: string;
+  secondTokenLabel?: string;
+  secondTokenDecimals?: number;
+  tokenId?: string;
+  tokenQuant?: string;
+  tokenLabel?: string;
+  tokenDecimals?: number;
+  otherTokenId?: string;
+  otherTokenQuant?: string;
+  otherTokenLabel?: string;
+  otherTokenDecimals?: number;
+  reserveAfter?: string;
+  otherReserveAfter?: string;
+  soldTokenId?: string;
+  soldQuant?: string;
+  soldLabel?: string;
+  soldDecimals?: number;
+  receivedTokenId?: string;
+  receivedQuant?: string;
+  receivedLabel?: string;
+  receivedDecimals?: number;
+  estimatedReceivedQuant?: string;
+  minReceivedQuant?: string;
+  releasedAmount?: string;
+  stillFrozenAmount?: string;
   // confirmed / failed on-chain numbers
   blockNumber?: number;
   energyUsed?: number;

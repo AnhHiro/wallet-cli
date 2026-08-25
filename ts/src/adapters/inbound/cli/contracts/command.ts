@@ -2,7 +2,10 @@
 import type { ZodObject, ZodRawShape, ZodType } from "zod";
 import type { ChainFamily } from "../../../../domain/family/index.js";
 import type { NetworkDescriptor } from "../../../../domain/types/network.js";
-import type { NetworkRequirement, WalletRequirement } from "../../../../application/contracts/index.js";
+import type {
+  NetworkRequirement,
+  WalletRequirement,
+} from "../../../../application/contracts/index.js";
 import type { ExecutionContext } from "./execution-context.js";
 
 export interface Example {
@@ -10,12 +13,26 @@ export interface Example {
   note?: string;
 }
 
+/** a set of options of which exactly one must be supplied, enforced in the command's refine.
+ *  Help renders it as a labelled block ("Exactly one of these — <label>:") instead of tagging every
+ *  member "[optional]", which reads as "all of these may be omitted". `flags` are kebab flag names
+ *  in the order they should be listed, and may include a `--*-stdin` channel flag (e.g. "tx-stdin"). */
+export interface ExclusiveGroup {
+  label: string;
+  flags: string[];
+  /** "exactly-one" (default): the set is jointly required, so members drop their "[optional]" tag.
+   *  "at-most-one": omitting the whole set is valid (there is a default behaviour) — members really
+   *  are optional and keep the tag; only picking two is rejected. */
+  select?: "exactly-one" | "at-most-one";
+}
+
 // "optional" = the command operates on an account; --account is optional and falls back to the
 // active account (errors only if no account exists at all). "none" = never touches an account.
 // (No "required": no command forces --account — active is always a valid default. cf. network.)
-// "required" = unlocks the master password (sign / read secrets / encrypt);
-// "none" = never unlocks. (No middle state — a command either needs the password or it doesn't.)
-export type AuthRequirement = "none" | "required";
+// "required" = every execution needs the master password (sign / read secrets / encrypt);
+// "conditional" = only selected execution modes need it; other modes run without a password;
+// "none" = never needs it.
+export type AuthRequirement = "none" | "conditional" | "required";
 
 /** secret/payload channel a command reads from stdin; documents the matching --*-stdin flag.
  *  (Wallet-secret entry — mnemonic/private-key/master-password — is TTY-only, so those never
@@ -56,6 +73,10 @@ interface CommandDefinitionBase<I, O> {
   secretsTtyOnly?: boolean;
   /** gap-fill prompt hints, by field name: "skip" = never prompt this optional field; "default-label" = offer a generated default. */
   promptHints?: Record<string, "skip" | "default-label">;
+  /** fields that must not be gap-filled for THIS invocation, from raw argv. Use when a mode flag
+   *  makes a field meaningless (`backup --records` exports nothing, so no account is asked for).
+   *  Unlike `promptHints`, this is per-invocation rather than static. */
+  skipGapFill?: (argv: Record<string, unknown>) => string[];
   capability?: string;
   /** one-line command listing text (parent group's verb list). Keep it terse — a single line. */
   summary?: string;
@@ -66,6 +87,8 @@ interface CommandDefinitionBase<I, O> {
   /** extra command-specific preconditions rendered in the help "Requires:" block, ahead of the
    *  auto-derived network/auth/account lines (e.g. a connected Ledger for `import ledger`). */
   requires?: string[];
+  /** mutually-exclusive option sets, surfaced in help; see ExclusiveGroup. */
+  exclusive?: ExclusiveGroup[];
   /** per-field zod object; feeds the arity adapter + HelpService. */
   fields: ZodObject<ZodRawShape>;
   /** full validation schema (often fields.superRefine), used in dispatch. */
@@ -73,6 +96,10 @@ interface CommandDefinitionBase<I, O> {
   examples: Example[];
   /** Optional command-specific renderer for text mode. JSON mode always uses the envelope. */
   formatText?: TextFormatter<O>;
+  /** Override the envelope's `command` for a mode-switching command whose modes return different
+   *  `data` shapes (`backup` vs `backup.records`). `command` names the SEMANTIC command, not how it
+   *  was typed, so a reader can branch on it instead of sniffing fields. Absent ⇒ the path. */
+  commandIdFor?: (input: I) => string;
 }
 
 /** A neutral (family-less) command — wallet/config/meta operations that never receive a
@@ -94,7 +121,7 @@ export interface FamilyBinding<I = any, O = any> {
 
 /** Neutral, service-free declaration of a logical chain command. Generic over O, the single
  *  family-agnostic View every family's run returns. */
-export interface ChainSpec<I = any, O = any> {
+export interface ChainSpec<_I = any, O = any> {
   path: string[];
   network: Exclude<NetworkRequirement, "none">;
   wallet: WalletRequirement;
@@ -113,6 +140,8 @@ export interface ChainSpec<I = any, O = any> {
    *  instead of `summary` when present. Absent ⇒ leaf help falls back to `summary`. */
   description?: string;
   examples: Example[];
+  /** mutually-exclusive option sets, surfaced in help; see ExclusiveGroup. */
+  exclusive?: ExclusiveGroup[];
   baseFields: ZodObject<ZodRawShape>;
   baseRefine?: (value: any, ctx: import("zod").RefinementCtx) => void;
   /** shared text renderer; uses FAMILY_RENDER[net.family] for family-shaped rows. */

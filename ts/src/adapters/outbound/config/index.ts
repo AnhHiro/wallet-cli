@@ -3,12 +3,11 @@
  * build the network registry, and resolve canonical network ids. The descriptor stays pure data;
  * live RPC clients are owned by the chain gateway provider, not attached here.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { parse as parseYaml } from "yaml";
-import type {
-  Config, NetworkDescriptor, OutputMode } from "../../../domain/types/index.js";
+import type { Config, NetworkDescriptor, OutputMode } from "../../../domain/types/index.js";
 import type { NetworkRegistry as INetworkRegistry } from "../../../application/ports/network-registry.js";
 import { UsageError } from "../../../domain/errors/index.js";
 import { BUILTIN_NETWORKS, DEFAULT_CONFIG } from "./builtins.js";
@@ -35,31 +34,110 @@ export class ConfigLoader {
     let timeoutMs = DEFAULT_CONFIG.timeoutMs;
     let waitTimeoutMs = DEFAULT_CONFIG.waitTimeoutMs;
     let price: Config["price"];
+    let tronlinkSecretId: string | undefined;
+    let tronlinkSecretKey: string | undefined;
+    let tronlinkChannel: string | undefined;
+    let gasfreeApiKey: string | undefined;
+    let gasfreeApiSecret: string | undefined;
 
     const path = ConfigLoader.configPath(env);
     if (existsSync(path)) {
-      const raw = parseYaml(readFileSync(path, "utf8")) ?? {};
+      const raw = readConfigDocument(path);
+      if (
+        (typeof raw.tronlinkSecretKey === "string" && raw.tronlinkSecretKey !== "") ||
+        (typeof raw.gasfreeApiSecret === "string" && raw.gasfreeApiSecret !== "")
+      ) {
+        assertSecretConfigPermissions(path);
+      }
       if (typeof raw.defaultNetwork === "string" && raw.defaultNetwork.trim() !== "") {
         defaultNetwork = raw.defaultNetwork;
       }
-      if (raw.defaultOutput === "json" || raw.defaultOutput === "text") defaultOutput = raw.defaultOutput;
+      if (raw.defaultOutput === "json" || raw.defaultOutput === "text")
+        defaultOutput = raw.defaultOutput;
       if (typeof raw.timeoutMs === "number") timeoutMs = raw.timeoutMs;
       // Same rule ConfigService enforces on write — a hand-edited file must not slip through
       // negative or fractional values into the effective config.
-      if (Number.isInteger(raw.waitTimeoutMs) && raw.waitTimeoutMs >= 0) waitTimeoutMs = raw.waitTimeoutMs;
+      if (Number.isInteger(raw.waitTimeoutMs) && raw.waitTimeoutMs >= 0)
+        waitTimeoutMs = raw.waitTimeoutMs;
       if (raw.price && typeof raw.price === "object") {
         const p = raw.price as Record<string, unknown>;
         const provider = p.provider === "none" ? "none" : "coingecko";
         price = { provider };
         if (typeof p.baseUrl === "string" && p.baseUrl.trim() !== "") price.baseUrl = p.baseUrl;
       }
+      if (validCredential(raw.tronlinkSecretId)) tronlinkSecretId = raw.tronlinkSecretId;
+      if (validCredential(raw.tronlinkSecretKey)) tronlinkSecretKey = raw.tronlinkSecretKey;
+      if (validCredential(raw.tronlinkChannel)) tronlinkChannel = raw.tronlinkChannel;
+      if (validCredential(raw.gasfreeApiKey)) gasfreeApiKey = raw.gasfreeApiKey;
+      if (validCredential(raw.gasfreeApiSecret)) gasfreeApiSecret = raw.gasfreeApiSecret;
       if (raw.networks && typeof raw.networks === "object") {
-        for (const [id, d] of Object.entries(raw.networks as Record<string, Record<string, unknown>>)) {
+        for (const [id, d] of Object.entries(
+          raw.networks as Record<string, Record<string, unknown>>,
+        )) {
           networks[id] = { ...(networks[id] ?? {}), ...d, id } as NetworkDescriptor;
         }
       }
     }
-    return { defaultNetwork, defaultOutput, timeoutMs, waitTimeoutMs, networks, price };
+    return {
+      defaultNetwork,
+      defaultOutput,
+      timeoutMs,
+      waitTimeoutMs,
+      networks,
+      price,
+      tronlinkSecretId,
+      tronlinkSecretKey,
+      tronlinkChannel,
+      gasfreeApiKey,
+      gasfreeApiSecret,
+    };
+  }
+}
+
+function validCredential(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 256 &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+/**
+ * Read config.yaml, reporting the condition rather than the underlying error.
+ *
+ * Both failures carry material we must not surface: a YAML parse error quotes the offending line,
+ * which may sit right beside `gasfreeApiSecret`, and a read error carries whatever the OS put in
+ * its message. Classifying here also keeps the user out of the generic `internal_error` they would
+ * otherwise get from the bootstrap boundary for what is simply a broken file.
+ */
+function readConfigDocument(path: string) {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    throw new UsageError("invalid_config", `config.yaml cannot be read: ${path}`);
+  }
+  try {
+    return parseYaml(text) ?? {};
+  } catch {
+    throw new UsageError("invalid_config", `config.yaml is not valid YAML: ${path}`);
+  }
+}
+
+function assertSecretConfigPermissions(path: string): void {
+  if (process.platform === "win32") return;
+  if (lstatSync(path).isSymbolicLink()) {
+    throw new UsageError(
+      "insecure_config",
+      "config.yaml containing service credentials must not be a symbolic link",
+    );
+  }
+  if ((statSync(path).mode & 0o077) !== 0) {
+    throw new UsageError(
+      "insecure_config",
+      "config.yaml containing service credentials must have mode 0600; run chmod 600 on the file",
+    );
   }
 }
 
