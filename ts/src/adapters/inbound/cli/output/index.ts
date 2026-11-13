@@ -1,24 +1,16 @@
-/**
- * OutputFormatter — turn outcomes into result/event frame strings without changing
- * behavior. Instead of one class branching on `if (output === "json")`, this is an interface
- * with two implementations chosen by createOutputFormatter (borrowed from ledger wallet-cli
- * output.ts). The formatter only computes strings; StreamManager owns writing & stream choice.
- *   - success → single terminal frame (caller hands to streams.result)
- *   - error   → terminal error (json envelope to stdout, or short stderr line)
- *   - event   → intermediate progress frame (caller hands to streams.event); null = not shown
- * JSON mode emits exactly one terminal envelope; empty data is {}; big numbers stay strings.
- * Neutral commands omit `chain`.
- */
+// Format results and progress; errors are written through the streams port.
 import type { NetworkDescriptor, OutputMode } from "../../../../domain/types/index.js";
 import type { ProgressEvent } from "../../../../application/contracts/index.js";
-import type { Pagination, StreamManager, TextFormatter } from "../contracts/index.js";
+import type { Pagination, QueryEcho, StreamManager, TextFormatter } from "../contracts/index.js";
 import type { CliError } from "../../../../domain/errors/index.js";
 import { OutputEnvelope, toJson } from "./envelope.js";
 import { renderErrorDetails, renderGenericText } from "../render/index.js";
 import { sanitizeText } from "../render/scalars.js";
+import { maskCredentials } from "./mask.js";
+import { cliMessage, errorEnvelope } from "./errors.js";
 
 export interface OutputFormatter {
-  /** the single result frame for the caller to hand to streams.result. */
+  // Return the result frame for streams.result.
   success(
     command: string,
     net: NetworkDescriptor | undefined,
@@ -26,9 +18,9 @@ export interface OutputFormatter {
     formatText?: TextFormatter,
     accountLabel?: string,
   ): string;
-  /** terminal error output (JSON envelope to stdout, or short line to stderr). */
+  // Write JSON errors to stdout or human errors to stderr.
   error(err: CliError, ctx?: { commandId?: string; net?: NetworkDescriptor }): void;
-  /** intermediate progress frame for streams.event; null = this mode does not show it. */
+  // Return a progress frame for streams.event; null suppresses it.
   event(e: ProgressEvent): string | null;
 }
 
@@ -36,6 +28,8 @@ abstract class BaseOutputFormatter {
   constructor(
     protected readonly streams: StreamManager,
     protected readonly startedAt: number,
+    // External error text can echo the credentials a request used.
+    protected readonly credentials: readonly string[],
   ) {}
 
   protected meta() {
@@ -45,19 +39,25 @@ abstract class BaseOutputFormatter {
 
 class JsonOutputFormatter extends BaseOutputFormatter implements OutputFormatter {
   success(command: string, net: NetworkDescriptor | undefined, data: unknown): string {
-    // JSON mode always uses the envelope; the account label is a text-mode display nicety.
-    const paged = extractPagination(data);
+    const paged = extractPagination(stripView(data));
+    const ordered = extractQuery(paged.data);
     return toJson(
-      OutputEnvelope.success(command, net, paged.data, {
+      OutputEnvelope.success(command, net, ordered.data, {
         ...this.meta(),
         ...(paged.pagination ? { pagination: paged.pagination } : {}),
+        ...(ordered.query ? { query: ordered.query } : {}),
       }),
     );
   }
 
   error(err: CliError, ctx?: { commandId?: string; net?: NetworkDescriptor }): void {
-    const env = OutputEnvelope.error(ctx?.commandId ?? "", ctx?.net, err.toEnvelope(), this.meta());
-    this.streams.result(toJson(env));
+    const env = OutputEnvelope.error(
+      ctx?.commandId ?? "",
+      ctx?.net,
+      errorEnvelope(err),
+      this.meta(),
+    );
+    this.streams.result(maskCredentials(toJson(env), this.credentials));
   }
 
   event(e: ProgressEvent): string {
@@ -65,24 +65,34 @@ class JsonOutputFormatter extends BaseOutputFormatter implements OutputFormatter
   }
 }
 
-/**
- * Pagination is envelope metadata in the public JSON contract — ONE location for every list command,
- * so a caller pages any of them without knowing the payload's shape. Text renderers keep reading the
- * same value from their view model to title `showing N of total`, which is why only this path moves it.
- *
- * What identifies a window is `offset` + `limit`; `total` is OPTIONAL and normalised to `null`,
- * because for TRON's paginated endpoints no count exists at all (obtaining one would mean
- * transferring every record). Requiring it here is what used to strand `asset list` / `exchange list`
- * in `data` while `backup --records` / `proposal show` moved to `meta` — the same envelope carrying
- * the same concept in two places, decided by whether a total happened to be knowable.
- */
+// Move query metadata only in JSON mode; text renderers retain the original view.
+function extractQuery(data: unknown): { data: unknown; query?: QueryEcho } {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return { data };
+  const source = data as Record<string, unknown>;
+  const value = source.query;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { data };
+  const { orderBy, sort } = value as Record<string, unknown>;
+  if (typeof orderBy !== "string" || typeof sort !== "string") return { data };
+  const rest = { ...source };
+  delete rest.query;
+  return { data: rest, query: { orderBy, sort } };
+}
+
+// The reserved view key holds text-only data and must not appear in JSON.
+function stripView(data: unknown): unknown {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return data;
+  if (!("view" in (data as Record<string, unknown>))) return data;
+  const { view: _view, ...rest } = data as Record<string, unknown>;
+  return rest;
+}
+
 function extractPagination(data: unknown): { data: unknown; pagination?: Pagination } {
   if (!data || typeof data !== "object" || Array.isArray(data)) return { data };
   const source = data as Record<string, unknown>;
   const value = source.pagination;
   if (!value || typeof value !== "object" || Array.isArray(value)) return { data };
   const pagination = value as Record<string, unknown>;
-  // Not a window → leave it alone: `pagination` might be an unrelated field on some future payload.
+  // Leave unrelated pagination fields in the payload.
   if (
     !Number.isInteger(pagination.offset) ||
     !(pagination.limit === null || Number.isInteger(pagination.limit))
@@ -92,6 +102,10 @@ function extractPagination(data: unknown): { data: unknown; pagination?: Paginat
     offset: Number(pagination.offset),
     limit: pagination.limit === null ? null : Number(pagination.limit),
     total: Number.isInteger(pagination.total) ? Number(pagination.total) : null,
+    ...(typeof pagination.hasMore === "boolean" ? { hasMore: pagination.hasMore } : {}),
+    ...(typeof pagination.nextCursor === "string" || pagination.nextCursor === null
+      ? { nextCursor: pagination.nextCursor }
+      : {}),
   };
   const clean = { ...source };
   delete clean.pagination;
@@ -99,8 +113,7 @@ function extractPagination(data: unknown): { data: unknown; pagination?: Paginat
 }
 
 class HumanOutputFormatter extends BaseOutputFormatter implements OutputFormatter {
-  // Text mode: strip terminal control bytes from every frame so a hostile wallet label or remote
-  // token/RPC metadata value cannot inject ANSI/OSC sequences (CLI-OUT-001). JSON mode stays raw.
+  // Sanitize text frames against terminal injection; JSON retains raw values.
   success(
     command: string,
     net: NetworkDescriptor | undefined,
@@ -114,11 +127,10 @@ class HumanOutputFormatter extends BaseOutputFormatter implements OutputFormatte
   }
 
   error(err: CliError): void {
-    // Errors that are a choice rather than a dead end append their candidate table (see
-    // renderErrorDetails); everything else stays the single line it has always been.
-    const line = `error [${err.code}]: ${err.message}`;
+    const line = `error [${err.code}]: ${cliMessage(err.userMessage).textMessage}`;
     const candidates = renderErrorDetails(err.details);
-    this.streams.errorLine(sanitizeText(candidates ? `${line}\n${candidates}` : line));
+    const text = candidates ? `${line}\n${candidates}` : line;
+    this.streams.errorLine(sanitizeText(maskCredentials(text, this.credentials)));
   }
 
   event(e: ProgressEvent): string {
@@ -130,15 +142,17 @@ export function createOutputFormatter(
   output: OutputMode,
   streams: StreamManager,
   startedAt: number,
+  credentials: readonly string[] = [],
 ): OutputFormatter {
   return output === "json"
-    ? new JsonOutputFormatter(streams, startedAt)
-    : new HumanOutputFormatter(streams, startedAt);
+    ? new JsonOutputFormatter(streams, startedAt, credentials)
+    : new HumanOutputFormatter(streams, startedAt, credentials);
 }
 
-// plain human progress line (no spinner / no TTY detection — Standard CLI / agent-first).
 function renderEvent(e: ProgressEvent): string {
   switch (e.type) {
+    case "activity":
+      return `⏳ ${e.message}`;
     case "awaiting_device":
       switch (e.reason) {
         case "sign":

@@ -1,8 +1,4 @@
-/**
- * `backup` password gating, exercised through real dispatch — the ordering only exists there.
- * A Ledger-only keystore has no master password sentinel, so verifying one can never succeed:
- * the account-type check must therefore win over the password gate.
- */
+// Ledger-only keystores may have no password; dispatch must check exportability first.
 import { describe, it, expect, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,8 +17,9 @@ import { Prompter } from "../input/prompt/index.js";
 import { WalletService } from "../../../../application/use-cases/wallet-service.js";
 import { registerWalletCommands } from "./wallet.js";
 import type { SessionRef } from "../contracts/index.js";
+import { CommandDeadline } from "../../../../application/services/command-deadline.js";
 
-// Cheap KDF for keystore encryption in this suite — see cheap-scrypt.ts. Production untouched.
+// Use a cheap KDF for test fixtures.
 vi.mock(
   "@noble/hashes/scrypt.js",
   async () => import("../../../outbound/persistence/crypto/__test-support__/cheap-scrypt.js"),
@@ -62,13 +59,22 @@ function fixture(opts: { tty: boolean }) {
     { write: () => ({ out: "unused", fileMode: "0600", bytes: 0 }) },
     { append: () => {}, list: () => [] },
   );
-  registerWalletCommands(registry, { walletService, ledger: {} as any } as any);
+  registerWalletCommands(registry, { walletService });
 
   const session: SessionRef = {};
   const shellOpts: ShellOptions = {
     registry,
     globals: { output: "text", verbose: false },
-    deps: { config, networkRegistry, streams, secrets, keystore, prompter, formatter },
+    deps: {
+      config,
+      deadline: new CommandDeadline(0),
+      networkRegistry,
+      streams,
+      secrets,
+      accounts: walletService,
+      prompter,
+      formatter,
+    },
     targetResolver: new TargetResolver({ networkRegistry, keystore }),
     caps: new CapabilityRegistry(),
     streams,
@@ -98,7 +104,7 @@ describe("backup password gating", () => {
     await secrets.primePassword({ mode: "set" });
     const { accountId } = keystore.import({ secret: VALID_MNEMONIC, type: "seed" });
     secrets.clearPrimed();
-    spyPrime.mockClear(); // ignore the prime used to seed the wallet above
+    spyPrime.mockClear();
 
     await buildCli(shellOpts).parseAsync(["backup", accountId]);
 
@@ -107,11 +113,6 @@ describe("backup password gating", () => {
   });
 });
 
-/**
- * The log filters only mean anything in --records mode; accepting one on an export would silently
- * ignore what the caller asked for. --offset is the one that has to be asserted deliberately: it
- * reads as a plain pagination flag, so a default value would hide it from the guard entirely.
- */
 describe("backup --records flag gating", () => {
   for (const args of [
     ["--from", "2026-08-01"],
@@ -129,6 +130,17 @@ describe("backup --records flag gating", () => {
     });
   }
 
+  for (const args of [["--keystore"], ["--out", "./out.json"]]) {
+    it(`rejects ${args[0]} with --records as invalid_option`, async () => {
+      const { shellOpts, spyPrime } = fixture({ tty: false });
+
+      await expect(
+        buildCli(shellOpts).parseAsync(["backup", "--records", ...args]),
+      ).rejects.toMatchObject({ code: "invalid_option" });
+      expect(spyPrime).not.toHaveBeenCalled();
+    });
+  }
+
   it("passes the filters through with --records", async () => {
     const { shellOpts, walletService } = fixture({ tty: false });
     const spy = vi.spyOn(walletService, "backupRecords");
@@ -138,7 +150,6 @@ describe("backup --records flag gating", () => {
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ offset: 1, limit: 5 }));
   });
 
-  // offset is optional now; the 0 has to come from the service, or the emitted pagination changes.
   it("still reports offset 0 when --offset is omitted", async () => {
     const { shellOpts, walletService } = fixture({ tty: false });
     const spy = vi.spyOn(walletService, "backupRecords");
@@ -147,5 +158,35 @@ describe("backup --records flag gating", () => {
 
     expect(spy).toHaveBeenCalledWith(expect.objectContaining({ offset: undefined }));
     expect(spy.mock.results[0]!.value).toMatchObject({ pagination: { offset: 0, limit: null } });
+  });
+});
+
+describe("backup --keystore exports the selected network's key", () => {
+  // Supply globals separately, as the runner does.
+  async function exportWith(network?: string) {
+    const f = fixture({ tty: true });
+    await f.secrets.primePassword({ mode: "set" });
+    f.keystore.import({
+      secret: "test test test test test test test test test test test junk",
+      type: "seed",
+      label: "main",
+    });
+    const spy = vi.spyOn(f.walletService, "backupKeystore").mockReturnValue({} as never);
+    if (network) f.shellOpts.globals.network = network;
+
+    await buildCli(f.shellOpts).parseAsync(["backup", "main", "--keystore"]);
+
+    return spy.mock.calls[0]!.at(-1);
+  }
+
+  it.each([
+    ["sepolia", "evm"],
+    ["nile", "tron"],
+  ])("exports %s's family (%s)", async (network, family) => {
+    expect(await exportWith(network)).toBe(family);
+  });
+
+  it("falls back to the configured default network", async () => {
+    expect(await exportWith()).toBe("tron");
   });
 });

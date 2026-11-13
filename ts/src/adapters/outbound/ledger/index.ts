@@ -1,46 +1,35 @@
-/**
- * Ledger — device transport plus per-chain app.
- *
- * Transport is env-switchable so the same code path drives a real device or the Speculos
- * emulator (their only difference is the @ledgerhq transport; the hw-app-trx layer above is
- * identical). When SPECULOS_PORT is set we open the Speculos HTTP transport; otherwise we open
- * the USB/HID transport. Both @ledgerhq deps are imported lazily so the Speculos path works
- * without node-hid's native build present, and so unit tests that mock these methods never load
- * a native module.
- *
- * Only the TRON app is wired (hw-app-trx).
- *
- * This module never prints; callers print waiting prompts via StreamManager.
- */
+import { hidHandle } from "./hid-handle.js";
 import { utils as tronUtils } from "tronweb";
-import { assertTronTxIntegrity } from "../chain/tron/tx-integrity.js";
+import { createHash } from "node:crypto";
+import { Transaction, TypedDataEncoder, type TransactionLike } from "ethers";
+import type { TronTransactionIntegrityCheck } from "../../../application/ports/chain/tron-transaction-integrity.js";
 import type {
   SignedTx,
+  TronTransactionArtifact,
   TypedDataPayload,
   TypedDataSignature,
   UnsignedTx,
 } from "../../../domain/types/index.js";
 
-/** a Ledger app's reported version + readiness (returned by `appConfig`). */
 export interface AppConfig {
   version: string;
   ready: boolean;
 }
 import { ChainError, CliError, ExecutionError, WalletError } from "../../../domain/errors/index.js";
 import { ChainFamily, FAMILIES } from "../../../domain/family/index.js";
-import { withTimeout } from "../../../domain/async/index.js";
 
 export interface GetAddressOpts {
-  /** false = silent derive (import scan / precheck); true = show on-device for user confirmation. */
+  // Show the address on-device for confirmation; false derives silently.
   display?: boolean;
   onWait?: () => void;
+  signal: AbortSignal;
 }
 
-/** Minimal shape of @ledgerhq/hw-app-trx's Trx we depend on (avoids a type-only dep at the seam). */
 interface TrxApp {
   getAddress(path: string, display?: boolean): Promise<{ publicKey: string; address: string }>;
   getAppConfiguration(): Promise<{ version: string }>;
   signTransaction(path: string, rawTxHex: string, tokenSignatures: string[]): Promise<string>;
+  signTransactionHash?(path: string, rawTxHashHex: string): Promise<string>;
   signPersonalMessage(path: string, messageHex: string): Promise<string>;
   signTIP712HashedMessage?(
     path: string,
@@ -49,18 +38,70 @@ interface TrxApp {
   ): Promise<string>;
 }
 
-/** hw-app-trx wants a BIP32 path WITHOUT the leading "m/" (e.g. 44'/195'/0'/0/0). */
+interface EthApp {
+  getAddress(path: string, display?: boolean): Promise<{ publicKey: string; address: string }>;
+  getAppConfiguration(): Promise<{ version: string }>;
+  signTransaction(
+    path: string,
+    rawTxHex: string,
+    resolution: null,
+  ): Promise<{ v: string; r: string; s: string }>;
+  signPersonalMessage(
+    path: string,
+    messageHex: string,
+  ): Promise<{ v: number; r: string; s: string }>;
+  signEIP712HashedMessage?(
+    path: string,
+    domainSeparatorHex: string,
+    hashStructMessageHex: string,
+  ): Promise<{ v: number; r: string; s: string }>;
+}
+
+type LedgerApp = TrxApp | EthApp;
+
+// Literal import specifiers allow static resolution and test mocking.
+const APP_LOADER: Record<ChainFamily, () => Promise<unknown>> = {
+  tron: () => import("@ledgerhq/hw-app-trx"),
+  evm: () => import("@ledgerhq/hw-app-eth"),
+};
+
+// Normalize parity or EIP-155-encoded v to 27/28 for a 65-byte r || s || v signature.
+function joinVrs(sig: { v: number | string; r: string; s: string }): string {
+  const raw = typeof sig.v === "number" ? BigInt(sig.v) : BigInt(`0x${sig.v.replace(/^0x/, "")}`);
+  const parity = raw < 27n ? raw & 1n : raw >= 35n ? (raw - 35n) & 1n : (raw - 27n) & 1n;
+  const v = (27n + parity).toString(16);
+  return `0x${sig.r.replace(/^0x/, "")}${sig.s.replace(/^0x/, "")}${v.padStart(2, "0")}`;
+}
+
+// TIP-712 returns parity 0/1; contract ecrecover requires 27/28, unlike raw transaction signatures.
+function normalizeTronTypedSignature(signature: string): string {
+  if (!/^[0-9a-fA-F]{128}(?:00|01|1[bBcC])$/.test(signature)) {
+    throw new ExecutionError(
+      "encoding_error",
+      "Ledger returned an invalid TIP-712 signature encoding",
+    );
+  }
+  const recovery = Number.parseInt(signature.slice(128), 16);
+  const v = recovery < 2 ? recovery + 27 : recovery;
+  return `0x${signature.slice(0, 128)}${v.toString(16)}`;
+}
+
+// Ledger paths omit the leading m/.
 function ledgerPath(path: string): string {
   return path.replace(/^m\//, "");
 }
 
-/** CJS-with-default interop under ESM/tsx: unwrap `.default` ourselves (cf. the demo's ledger.ts). */
+// Unwrap CommonJS default exports under ESM.
 function unwrap<T>(mod: unknown): T {
   return ((mod as { default?: T }).default ?? mod) as T;
 }
 
-/** Open the device transport: Speculos HTTP when SPECULOS_PORT is set, else USB/HID. */
-async function openTransport(): Promise<{ transport: unknown; close: () => Promise<void> }> {
+// Import transports lazily so Speculos does not require native HID.
+async function openTransport(): Promise<{
+  transport: unknown;
+  close: () => Promise<void>;
+  abort: () => void;
+}> {
   const port = process.env.SPECULOS_PORT;
   if (port) {
     const Speculos = unwrap<any>(await import("@ledgerhq/hw-transport-node-speculos-http"));
@@ -68,52 +109,59 @@ async function openTransport(): Promise<{ transport: unknown; close: () => Promi
       baseURL: process.env.SPECULOS_HOST ?? "http://127.0.0.1",
       apiPort: port,
     });
-    return { transport, close: () => transport.close() };
+    return hidHandle(transport);
   }
   const Hid = unwrap<any>(await import("@ledgerhq/hw-transport-node-hid-noevents"));
   const transport = await Hid.open("");
-  return { transport, close: () => transport.close() };
+  return hidHandle(transport);
 }
 
 function errMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** TRON app settings that gate a whole class of signing, each surfaced as its own APDU status.
- *  Without this mapping they arrive as an opaque "UNKNOWN_ERROR (0x6a8c)" and the user has no way
- *  to know the fix is a toggle in the app's own settings menu. */
 const APP_SETTING_REQUIRED: Record<number, string> = {
-  // E_MISSING_SETTING_SIGN_BY_HASH — gates TIP-712 typed data and any hash-only signing.
   0x6a8c:
     'enable "Sign by Hash" in the Ledger TRON app settings (Settings › Sign by Hash › Allowed)',
-  // E_MISSING_SETTING_DATA_ALLOWED — gates transactions carrying extra data.
   0x6a8b:
     'enable "Transactions data" in the Ledger TRON app settings to sign a transaction with extra data',
-  // E_MISSING_SETTING_CUSTOM_CONTRACT — gates contracts the app cannot decode.
   0x6a8d: 'enable "Custom contracts" in the Ledger TRON app settings to sign this contract call',
 };
 
-/** Map a thrown device/app error to a typed CliError (user-rejection vs not-ready). */
+function isLockedDevice(e: unknown): boolean {
+  return (
+    (e as { statusCode?: number }).statusCode === 0x5515 ||
+    (e as { name?: string }).name === "LockedDeviceError"
+  );
+}
+
 function classifyDeviceError(e: unknown): CliError {
   if (e instanceof CliError) return e;
-  // hw-transport surfaces APDU status as statusCode; 0x6985 = user declined on the device.
   const status = (e as { statusCode?: number }).statusCode;
   if (status === 0x6985)
     return new ChainError("signing_rejected", "the operation was rejected on the device");
-  // 0x6d00 (INS_NOT_SUPPORTED) is a standard status word every Ledger app shares — the app version
-  // does not implement this instruction, or the wrong app is open. Kept chain- and operation-agnostic
-  // on purpose: classifyDeviceError fires for any family and any call.
-  if (status === 0x6d00) {
+  if (
+    ["DisconnectedDevice", "DisconnectedDeviceDuringOperation"].includes(
+      (e as { name?: string })?.name ?? "",
+    )
+  ) {
+    return new WalletError(
+      "device_disconnected",
+      "the Ledger device disconnected; reconnect it, unlock it, open the correct app and retry",
+    );
+  }
+  if (isLockedDevice(e))
+    return new WalletError(
+      "device_locked",
+      "the Ledger device is locked — unlock it with your PIN and run the command again",
+    );
+  if (status === 0x6d00 || status === 0x6d02) {
     return new WalletError(
       "ledger_unsupported",
       "the Ledger app does not support this operation — make sure the correct app is open on the device and updated to its latest version",
     );
   }
-  // 0x6a80 (E_INCORRECT_DATA) is what the TRON app answers when its parser cannot make sense of the
-  // payload — a contract type it does not implement (app-tron parse.c falls through to
-  // `default: return USTREAM_FAULT`) or a genuinely malformed transaction. The "Sign by Hash"
-  // fallback sits in the display switch, past a successful parse, so no app setting rescues this.
-  // Keep the wording covering both causes: the status word alone cannot tell them apart.
+  // 0x6a80 covers unsupported contract types and malformed payloads; settings cannot fix it.
   if (status === 0x6a80) {
     return new WalletError(
       "ledger_unsupported",
@@ -122,81 +170,139 @@ function classifyDeviceError(e: unknown): CliError {
   }
   const setting = status === undefined ? undefined : APP_SETTING_REQUIRED[status];
   if (setting) return new WalletError("ledger_setting_required", setting);
-  return new ExecutionError("auth_required", `Ledger device error: ${errMessage(e)}`);
+  return new ExecutionError(
+    "auth_required",
+    "Ledger operation failed; reconnect the device, unlock it and open the correct app",
+    status === undefined ? undefined : { statusCode: status },
+  );
+}
+
+interface SignTransactionOptions {
+  onWarning?: (message: string) => void;
+}
+
+// Signing differs per device app; address and app-config reads are shared.
+interface FamilySigner {
+  transaction(
+    path: string,
+    tx: UnsignedTx,
+    signal?: AbortSignal,
+    options?: SignTransactionOptions,
+  ): Promise<SignedTx>;
+  message(path: string, messageHex: string, signal?: AbortSignal): Promise<string>;
+  typedData(
+    path: string,
+    payload: TypedDataPayload,
+    signal?: AbortSignal,
+  ): Promise<TypedDataSignature>;
 }
 
 export class Ledger {
-  // effective per-invocation timeout (--timeout, else config default); bounds every device call so an
-  // unresponsive device or an un-tapped on-device prompt can't hang the CLI. Mirrors TronChain for RPC.
-  constructor(private readonly timeoutMs = 60_000) {}
+  readonly #signers: Record<ChainFamily, FamilySigner> = {
+    tron: {
+      transaction: (path, tx, signal, options) =>
+        this.#signTronTransaction(path, tx, signal, options),
+      message: (path, messageHex, signal) =>
+        this.#bound<TrxApp, string>(
+          "tron",
+          async (trx) => `0x${await trx.signPersonalMessage(ledgerPath(path), messageHex)}`,
+          signal,
+        ),
+      typedData: (path, payload, signal) => this.#signTronTypedData(path, payload, signal),
+    },
+    evm: {
+      transaction: (path, tx, signal) => this.#signEvmTransaction(path, tx, signal),
+      message: (path, messageHex, signal) =>
+        this.#bound<EthApp, string>(
+          "evm",
+          async (eth) => joinVrs(await eth.signPersonalMessage(ledgerPath(path), messageHex)),
+          signal,
+        ),
+      typedData: (path, payload, signal) => this.#signEvmTypedData(path, payload, signal),
+    },
+  };
+
+  constructor(private readonly verifyTronTransaction: TronTransactionIntegrityCheck) {}
 
   private assertWired(family: ChainFamily): void {
     if (!FAMILIES[family].ledger) {
-      throw new ExecutionError(
-        "auth_required",
-        `Ledger ${family} app is not wired yet (only tron is supported)`,
-      );
+      throw new ExecutionError("auth_required", `Ledger ${family} app is not wired yet`);
     }
   }
 
-  // Open a transport, run `fn` against the Trx app, then always close (cf. the demo's withDevice).
-  // Timeout wraps the run so a timed-out call surfaces as ChainError("timeout"); callers'
-  // classifyDeviceError passes CliError through, so it isn't remapped to auth_required. Unlike an
-  // HTTP RPC, an in-flight HID APDU is not self-canceling: onTimeout MUST close the transport, which
-  // rejects the pending APDU (so the run unwinds) and releases the native handle. Without this the
-  // handle leaks, pins libuv, and the process hangs after a timeout — breaking the deterministic-exit
-  // contract. close() may run twice (here and in the finally); both swallow errors so double-close is
-  // harmless.
-  //
-  // An optional `signal` gives callers the same lever the timeout uses: aborting closes the
-  // transport, which rejects the pending APDU and frees the native handle immediately instead of
-  // leaving it open until this method's own timeout expires.
-  #bound<T>(fn: (trx: TrxApp) => Promise<T>, signal?: AbortSignal): Promise<T> {
-    let handle: { transport: unknown; close: () => Promise<void> } | undefined;
-    // `cancelled` matters because the abort can land before openTransport() resolves: at that
-    // moment there is no handle to close, and a fire-once listener will not run again. Recording
-    // it lets the opener close the transport it is about to receive instead of leaking it.
+  // The signal closes the transport and ends the operation with its reason (the deadline's timeout),
+  // or "cancelled" for any other abort; completed operations close normally.
+  #bound<A extends LedgerApp, T>(
+    family: ChainFamily,
+    fn: (app: A) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    let handle: { transport: unknown; close: () => Promise<void>; abort: () => void } | undefined;
+    // Remember early cancellation so a transport that opens later is still closed.
     let cancelled = false;
     const closeTransport = (): void => {
       cancelled = true;
-      handle?.close().catch(() => {});
+      handle?.abort();
     };
     const run = (async () => {
-      const Trx = unwrap<new (transport: unknown) => TrxApp>(await import("@ledgerhq/hw-app-trx"));
+      const App = unwrap<new (transport: unknown) => LedgerApp>(await APP_LOADER[family]());
       try {
         handle = await openTransport();
       } catch (e) {
-        // no device / emulator reachable — the pipeline treats this as "device not ready".
-        throw new ExecutionError("auth_required", `cannot reach Ledger device: ${errMessage(e)}`);
+        if (isLockedDevice(e)) throw classifyDeviceError(e);
+        const noDevice =
+          (e as { id?: string })?.id === "NoDevice" ||
+          (e as { name?: string })?.name === "NoDevice";
+        throw new WalletError(
+          noDevice ? "device_not_found" : "device_unavailable",
+          noDevice
+            ? "no Ledger device was found; connect it, unlock it and open the correct app"
+            : "cannot open the Ledger device; close Ledger Live and other applications using it, check USB access, reconnect it and retry",
+        );
       }
       if (cancelled) {
-        await handle.close().catch(() => {});
+        handle.abort();
         throw new ChainError(
           "cancelled",
           "the Ledger operation was cancelled before it reached the device",
         );
       }
       try {
-        return await fn(new Trx(handle.transport));
+        return await fn(new App(handle.transport) as A);
       } finally {
         await handle.close().catch(() => {});
       }
     })();
+    let rejectCancelled!: (error: CliError) => void;
+    const cancellation = new Promise<never>((_resolve, reject) => {
+      rejectCancelled = reject;
+    });
+    const onAbort = () => {
+      closeTransport();
+      const reason: unknown = signal?.reason;
+      rejectCancelled(
+        reason instanceof CliError
+          ? reason
+          : new ChainError("cancelled", "the Ledger operation was cancelled"),
+      );
+    };
     if (signal) {
-      if (signal.aborted) closeTransport();
-      else signal.addEventListener("abort", closeTransport, { once: true });
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
     }
-    return withTimeout(run, this.timeoutMs, closeTransport).finally(() => {
-      signal?.removeEventListener("abort", closeTransport);
+    return Promise.race([run, cancellation]).finally(() => {
+      signal?.removeEventListener("abort", onAbort);
     });
   }
 
-  async getAddress(family: ChainFamily, path: string, opts?: GetAddressOpts): Promise<string> {
-    opts?.onWait?.();
+  async getAddress(family: ChainFamily, path: string, opts: GetAddressOpts): Promise<string> {
+    opts.onWait?.();
     this.assertWired(family);
     try {
-      return await this.#bound(
-        async (trx) => (await trx.getAddress(ledgerPath(path), opts?.display ?? false)).address,
+      return await this.#bound<TrxApp | EthApp, string>(
+        family,
+        async (app) => (await app.getAddress(ledgerPath(path), opts.display ?? false)).address,
+        opts.signal,
       );
     } catch (e) {
       throw classifyDeviceError(e);
@@ -208,32 +314,10 @@ export class Ledger {
     path: string,
     tx: UnsignedTx,
     signal?: AbortSignal,
+    options?: SignTransactionOptions,
   ): Promise<SignedTx> {
     this.assertWired(family);
-    // The device signs raw_data_hex, so the same integrity rules the software strategy enforces
-    // apply here — a Ledger account must not be the weaker signer. See tx-integrity.ts.
-    if (family === "tron") assertTronTxIntegrity(tx);
-    const rawTxHex = (tx as { raw_data_hex?: string }).raw_data_hex;
-    if (!rawTxHex)
-      throw new ChainError(
-        "invalid_transaction",
-        "TRON transaction is missing raw_data_hex for Ledger signing",
-      );
-    // TRON multi-sig collects several signatures on one transaction, so an existing signature[]
-    // must be preserved and appended to — matching the software path (tronweb pushes).
-    const existing = (tx as { signature?: unknown }).signature;
-    const prior = Array.isArray(existing) ? existing : [];
-    try {
-      return await this.#bound(async (trx) => {
-        const signature = await trx.signTransaction(ledgerPath(path), rawTxHex, []);
-        return {
-          ...(tx as object),
-          signature: prior.includes(signature) ? prior : [...prior, signature],
-        };
-      }, signal);
-    } catch (e) {
-      throw classifyDeviceError(e);
-    }
+    return this.#signers[family].transaction(path, tx, signal, options);
   }
 
   async signMessage(
@@ -245,22 +329,13 @@ export class Ledger {
     this.assertWired(family);
     const messageHex = Buffer.from(message, "utf8").toString("hex");
     try {
-      return await this.#bound(
-        async (trx) => `0x${await trx.signPersonalMessage(ledgerPath(path), messageHex)}`,
-        signal,
-      );
+      return await this.#signers[family].message(path, messageHex, signal);
     } catch (e) {
       throw classifyDeviceError(e);
     }
   }
 
-  /**
-   * TIP-712 structured-data signing. The TRON app exposes only the *hashed* variant, so the two
-   * EIP-712 hashes are computed here — in the adapter, where the SDK dependency already lives —
-   * and the device can display only those hashes, not the message. The port deliberately takes the
-   * whole payload rather than pre-computed hashes: the Ethereum app also offers a full
-   * clear-signing APDU, and a hash-shaped port would lock a future EVM adapter out of it.
-   */
+  // Hashed signing shows only hashes on-device, not the structured message.
   async signTypedData(
     family: ChainFamily,
     path: string,
@@ -268,6 +343,76 @@ export class Ledger {
     signal?: AbortSignal,
   ): Promise<TypedDataSignature> {
     this.assertWired(family);
+    return this.#signers[family].typedData(path, payload, signal);
+  }
+
+  async #signTronTransaction(
+    path: string,
+    tx: UnsignedTx,
+    signal?: AbortSignal,
+    options?: SignTransactionOptions,
+  ): Promise<SignedTx> {
+    // Validate the bytes the device will sign against the displayed transaction.
+    this.verifyTronTransaction(tx as TronTransactionArtifact);
+    const rawTxHex = (tx as { raw_data_hex?: string }).raw_data_hex;
+    if (!rawTxHex)
+      throw new ChainError(
+        "invalid_transaction",
+        "TRON transaction is missing raw_data_hex for Ledger signing",
+      );
+    // Preserve earlier signatures when adding a multisig approval.
+    const existing = (tx as { signature?: unknown }).signature;
+    const prior = Array.isArray(existing) ? existing : [];
+    try {
+      return await this.#bound<TrxApp, SignedTx>(
+        "tron",
+        async (trx) => {
+          let signature: string;
+          try {
+            signature = await trx.signTransaction(ledgerPath(path), rawTxHex, []);
+          } catch (error) {
+            // This packing error occurs before any APDU is sent.
+            // Never retry a device rejection, transport failure, or cancelled operation as a hash.
+            if (
+              !(error instanceof Error) ||
+              error.message !== "Too many bytes to encode." ||
+              (error as { statusCode?: number }).statusCode !== undefined ||
+              signal?.aborted
+            ) {
+              throw error;
+            }
+            if (typeof trx.signTransactionHash !== "function") {
+              throw new WalletError(
+                "ledger_unsupported",
+                "this Ledger SDK cannot sign TRON transaction hashes",
+              );
+            }
+            options?.onWarning?.(
+              "Ledger transaction data exceeds the SDK field-size limit; falling back to hash signing. The device shows only the transaction hash, not the transaction details. Verify the transaction on this computer before approving its hash.",
+            );
+            // Hash the validated bytes rather than trusting the supplied txID.
+            const hash = createHash("sha256")
+              .update(Buffer.from(rawTxHex.replace(/^0x/, ""), "hex"))
+              .digest("hex");
+            signature = await trx.signTransactionHash(ledgerPath(path), hash);
+          }
+          return {
+            ...(tx as TronTransactionArtifact),
+            signature: prior.includes(signature) ? prior : [...prior, signature],
+          };
+        },
+        signal,
+      );
+    } catch (e) {
+      throw classifyDeviceError(e);
+    }
+  }
+
+  async #signTronTypedData(
+    path: string,
+    payload: TypedDataPayload,
+    signal?: AbortSignal,
+  ): Promise<TypedDataSignature> {
     const { domain, types, message } = payload;
     let digest: string;
     let primaryType: string;
@@ -286,32 +431,119 @@ export class Ledger {
       );
     }
     try {
-      return await this.#bound(async (trx) => {
-        if (typeof trx.signTIP712HashedMessage !== "function") {
-          throw new WalletError(
-            "ledger_unsupported",
-            "this Ledger TRON app version cannot sign TIP-712 typed data; update the app",
+      return await this.#bound<TrxApp, TypedDataSignature>(
+        "tron",
+        async (trx) => {
+          if (typeof trx.signTIP712HashedMessage !== "function") {
+            throw new WalletError(
+              "ledger_unsupported",
+              "this Ledger TRON app version cannot sign TIP-712 typed data; update the app",
+            );
+          }
+          const signature = await trx.signTIP712HashedMessage(
+            ledgerPath(path),
+            domainHash,
+            messageHash,
           );
-        }
-        const signature = await trx.signTIP712HashedMessage(
-          ledgerPath(path),
-          domainHash,
-          messageHash,
-        );
-        return { signature: `0x${signature}`, digest, primaryType };
-      }, signal);
+          return { signature: normalizeTronTypedSignature(signature), digest, primaryType };
+        },
+        signal,
+      );
     } catch (e) {
       throw classifyDeviceError(e);
     }
   }
 
-  async appConfig(family: ChainFamily): Promise<AppConfig> {
+  async #signEvmTransaction(path: string, tx: UnsignedTx, signal?: AbortSignal): Promise<SignedTx> {
+    let transaction: Transaction;
+    try {
+      transaction = Transaction.from(tx as TransactionLike);
+    } catch (e) {
+      throw new ChainError(
+        "invalid_transaction",
+        `EVM transaction could not be encoded for Ledger signing: ${errMessage(e)}`,
+      );
+    }
+    const unsignedHex = transaction.unsignedSerialized.replace(/^0x/, "");
+    try {
+      return await this.#bound<EthApp, SignedTx>(
+        "evm",
+        async (eth) => {
+          // Null resolution prevents the SDK from fetching CDN descriptors while signing.
+          const signed = await eth.signTransaction(ledgerPath(path), unsignedHex, null);
+          transaction.signature = joinVrs(signed);
+          // Retain the local hash so broadcast verification can reject a mismatched node txID.
+          return { raw: transaction.serialized, hash: transaction.hash! };
+        },
+        signal,
+      );
+    } catch (e) {
+      throw classifyDeviceError(e);
+    }
+  }
+
+  async #signEvmTypedData(
+    path: string,
+    payload: TypedDataPayload,
+    signal?: AbortSignal,
+  ): Promise<TypedDataSignature> {
+    const { domain, types, message } = payload;
+    const structTypes = Object.fromEntries(
+      Object.entries(types as Record<string, unknown>).filter(([name]) => name !== "EIP712Domain"),
+    ) as Record<string, Array<{ name: string; type: string }>>;
+    let digest: string;
+    let primaryType: string;
+    let domainHash: string;
+    let messageHash: string;
+    try {
+      primaryType = payload.primaryType ?? TypedDataEncoder.from(structTypes).primaryType;
+      digest = TypedDataEncoder.hash(domain as never, structTypes, message);
+      domainHash = TypedDataEncoder.hashDomain(domain as never).replace(/^0x/, "");
+      messageHash = TypedDataEncoder.hashStruct(primaryType, structTypes, message).replace(
+        /^0x/,
+        "",
+      );
+    } catch (e) {
+      throw new ChainError(
+        "invalid_transaction",
+        `typed data could not be hashed: ${errMessage(e)}`,
+      );
+    }
+    try {
+      return await this.#bound<EthApp, TypedDataSignature>(
+        "evm",
+        async (eth) => {
+          if (typeof eth.signEIP712HashedMessage !== "function") {
+            throw new WalletError(
+              "ledger_unsupported",
+              "this Ledger Ethereum app version cannot sign EIP-712 typed data; update the app",
+            );
+          }
+          const signed = await eth.signEIP712HashedMessage(
+            ledgerPath(path),
+            domainHash,
+            messageHash,
+          );
+          return { signature: joinVrs(signed), digest, primaryType };
+        },
+        signal,
+      );
+    } catch (e) {
+      throw classifyDeviceError(e);
+    }
+  }
+
+  async appConfig(family: ChainFamily, signal: AbortSignal): Promise<AppConfig> {
     this.assertWired(family);
     try {
-      return await this.#bound(async (trx) => ({
-        version: (await trx.getAppConfiguration()).version,
-        ready: true,
-      }));
+      return await this.#bound<TrxApp | EthApp, AppConfig>(
+        family,
+        async (trx) => ({
+          version: (await trx.getAppConfiguration()).version,
+          ready: true,
+        }),
+        signal,
+      );
     } catch (e) {
       throw classifyDeviceError(e);
     }

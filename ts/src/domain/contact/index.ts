@@ -1,12 +1,17 @@
 import type { ChainFamily, ContactEntry } from "../types/index.js";
-import { UsageError } from "../errors/index.js";
-import { TronAddress } from "../address/index.js";
+import { errorMessage, UsageError } from "../errors/index.js";
+import { addressBodyLength, addressCodec, CHAIN_FAMILIES } from "../family/index.js";
 
-const TRON_SHAPED = /^T[1-9A-HJ-NP-Za-km-z]{25,40}$/;
+// Match mistyped addresses too, so recipient typos cannot redirect through contact names.
+const ADDRESS_SHAPED: Array<[ChainFamily, { min: number; max: number }]> = [
+  ["tron", { min: 25, max: 40 }],
+  ["evm", { min: 38, max: 42 }],
+];
 const UNSAFE_TEXT = /[\p{Cc}\p{Cf}]/u;
-const ADDRESS = new TronAddress();
+// Entries per family; a stored book holding more is invalid.
+export const MAX_CONTACTS = 10_000;
 
-/** Case-insensitive, compatibility-normalized lookup key. */
+// Returns a case-insensitive NFKC lookup key.
 export function contactNameKey(input: string): string {
   return contactName(input).normalize("NFKC").toLowerCase();
 }
@@ -14,10 +19,10 @@ export function contactNameKey(input: string): string {
 export function contactName(input: string): string {
   const value = input.trim();
   const length = Array.from(value).length;
-  if (length < 1 || length > 64 || UNSAFE_TEXT.test(value) || TRON_SHAPED.test(value)) {
+  if (length < 1 || length > 64 || UNSAFE_TEXT.test(value) || resemblesAddress(value)) {
     throw new UsageError(
       "invalid_value",
-      "contact name must be 1-64 safe characters and must not resemble a TRON address",
+      "contact name must be 1-64 safe characters and must not resemble a chain address",
     );
   }
   return value;
@@ -38,22 +43,68 @@ export function createContact(
   address: string,
   noteInput?: string,
 ): ContactEntry {
-  if (family !== "tron" || !ADDRESS.validate(address)) {
-    throw new UsageError(
-      "invalid_value",
-      "contact address must be a valid TRON Base58Check address",
-    );
+  if (!CHAIN_FAMILIES.includes(family) || !addressCodec(family).validate(address)) {
+    throw new UsageError("invalid_address", `contact address must be a valid ${family} address`);
   }
   const name = contactName(nameInput);
   return {
     family,
     name,
     nameKey: contactNameKey(name),
-    address,
+    address: addressCodec(family).canonical(address),
     note: contactNote(noteInput),
   };
 }
 
-export function resemblesTronAddress(input: string): boolean {
-  return TRON_SHAPED.test(input.trim());
+// Includes malformed addresses.
+export function resemblesAddress(input: string): boolean {
+  return resembledFamily(input) !== undefined;
+}
+
+// Identifies the family by shape, without validating the address.
+export function resembledFamily(input: string): ChainFamily | undefined {
+  const value = input.trim();
+  return ADDRESS_SHAPED.find(([family, { min, max }]) => {
+    const length = addressBodyLength(family, value);
+    return length !== undefined && length >= min && length <= max;
+  })?.[0];
+}
+
+// A new contact must not reuse a name or an address held in any family.
+export function assertContactAddable(existing: readonly ContactEntry[], entry: ContactEntry): void {
+  const clash = existing.find((e) => e.nameKey === entry.nameKey || e.address === entry.address);
+  if (!clash) return;
+  throw new UsageError(
+    "already_exists",
+    clash.nameKey === entry.nameKey
+      ? errorMessage`a contact named ${clash.name} already exists`
+      : errorMessage`that address is already stored as ${clash.name}`,
+  );
+}
+
+// Names are unique across families in a stored book.
+export function hasDuplicateContactName(entries: readonly ContactEntry[]): boolean {
+  return new Set(entries.map((e) => e.nameKey)).size !== entries.length;
+}
+
+// The family's contacts with `entry` added, in name order. `all` holds every family's contacts.
+export function withContact(
+  all: readonly ContactEntry[],
+  family: readonly ContactEntry[],
+  entry: ContactEntry,
+): ContactEntry[] {
+  assertContactAddable(all, entry);
+  if (family.length >= MAX_CONTACTS) {
+    throw new UsageError("limit_exceeded", `contact book cannot exceed ${MAX_CONTACTS} entries`);
+  }
+  return [...family, entry].sort((a, b) => a.nameKey.localeCompare(b.nameKey));
+}
+
+export function withoutContact(
+  family: readonly ContactEntry[],
+  nameKey: string,
+): { entries: ContactEntry[]; removed: ContactEntry } {
+  const index = family.findIndex((entry) => entry.nameKey === nameKey);
+  if (index < 0) throw new UsageError("contact_not_found", `contact not found: ${nameKey}`);
+  return { entries: family.filter((_e, i) => i !== index), removed: family[index]! };
 }

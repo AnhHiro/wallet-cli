@@ -30,47 +30,171 @@ function command(
   const registry = new CommandRegistry();
   registerWalletCommands(registry, {
     walletService: walletService as never,
-    ledger: {} as never,
     qr,
   });
   const current = registry.resolveNeutral(["current"]);
   if (!current || isChainCommand(current)) {
     throw new Error("current command missing");
   }
+  const tronNet = {
+    id: "tron:728126428",
+    family: "tron",
+    nativeSymbol: "TRX",
+    chainId: "mainnet",
+    capabilities: [],
+  };
   const context = {
     activeAccount: options.account ?? "wlt_selected",
     output: options.output ?? "text",
     warn: vi.fn(),
+    network: undefined,
+    networkRegistry: { resolve: () => tronNet, resolveDefault: () => tronNet },
   };
-  return { current, context, walletService, qr };
+  return { current, context, tronNet, walletService, qr };
 }
 
 describe("current --qr", () => {
   it("encodes exactly the selected account's TRON address in text mode", async () => {
     const fixture = command({ account: "wlt_selected", encoded: "QR" });
-    const result = await fixture.current.run(fixture.context as never, undefined, { qr: true });
+    const result = await fixture.current.run(fixture.context as never, fixture.tronNet as never, {
+      qr: true,
+    });
 
     expect(fixture.walletService.current).toHaveBeenCalledWith("wlt_selected");
-    expect(fixture.qr.encode).toHaveBeenCalledWith(ADDRESS);
+    expect(fixture.qr.encode).toHaveBeenCalledWith(ADDRESS, expect.anything());
     expect(result).toMatchObject({
       receiveQr: "QR",
       receiveAddress: ADDRESS,
     });
   });
 
-  it("keeps JSON data unchanged and never builds terminal art", async () => {
-    const fixture = command({ output: "json" });
-    const result = await fixture.current.run(fixture.context as never, undefined, { qr: true });
+  it("draws for the terminal stdout writes to", async () => {
+    const fixture = command();
+    const stdout = process.stdout as { isTTY?: boolean; columns?: number };
+    const saved = { isTTY: stdout.isTTY, columns: stdout.columns };
+    stdout.isTTY = true;
+    stdout.columns = 97;
+    try {
+      await fixture.current.run(fixture.context as never, fixture.tronNet as never, { qr: true });
+    } finally {
+      stdout.isTTY = saved.isTTY;
+      stdout.columns = saved.columns;
+    }
 
-    expect(result).toEqual(descriptor);
+    expect(fixture.qr.encode).toHaveBeenCalledWith(ADDRESS, { isTTY: true, columns: 97 });
+  });
+
+  it("gives JSON the receive address and never builds terminal art", async () => {
+    const fixture = command({ output: "json" });
+    const result = await fixture.current.run(fixture.context as never, fixture.tronNet as never, {
+      qr: true,
+    });
+
+    expect(result).toEqual({ ...descriptor, receiveAddress: ADDRESS });
+    expect(result).not.toHaveProperty("receiveQr");
     expect(fixture.qr.encode).not.toHaveBeenCalled();
   });
 
   it("warns and returns the full normal descriptor on a narrow terminal", async () => {
     const fixture = command({ encoded: null });
-    const result = await fixture.current.run(fixture.context as never, undefined, { qr: true });
+    const result = await fixture.current.run(fixture.context as never, fixture.tronNet as never, {
+      qr: true,
+    });
 
     expect(result).toEqual(descriptor);
     expect(fixture.context.warn).toHaveBeenCalledWith(expect.stringContaining("too narrow"));
+  });
+});
+
+const EVM_ADDRESS = "0xe2E1a54926527Fbb4E4420DE4c6BAb82beAEE24D";
+
+function withNetwork(
+  addresses: Record<string, string>,
+  selected: string | undefined,
+  defaultFamily: "tron" | "evm" = "tron",
+) {
+  const walletService = { current: vi.fn(() => ({ ...descriptor, addresses })) };
+  const qr = { encode: vi.fn((a: string) => `QR(${a})`) };
+  const registry = new CommandRegistry();
+  registerWalletCommands(registry, {
+    walletService: walletService as never,
+    qr,
+  });
+  const current = registry.resolveNeutral(["current"]);
+  if (!current || isChainCommand(current)) throw new Error("current command missing");
+
+  const net = (family: string) => ({ id: `${family}:x`, family, chainId: "x", capabilities: [] });
+  const context = {
+    activeAccount: "wlt_selected",
+    output: "text" as "text" | "json",
+    warn: vi.fn(),
+  };
+  // Fixture mapping: eip155 is the EVM namespace; runtime uses the network descriptor.
+  const familyOf = (id: string) => (id.startsWith("eip155:") ? "evm" : "tron");
+  const network = net(selected ? familyOf(selected) : defaultFamily);
+  return { current, context, network, qr };
+}
+
+describe("current --qr picks the address by network family", () => {
+  const both = { tron: ADDRESS, evm: EVM_ADDRESS };
+
+  it("encodes the EVM address when an EVM network is selected", async () => {
+    const f = withNetwork(both, "eip155:11155111");
+    const result = (await f.current.run(f.context as never, f.network as never, { qr: true })) as {
+      receiveAddress: string;
+    };
+
+    expect(result.receiveAddress).toBe(EVM_ADDRESS);
+    expect(f.qr.encode).toHaveBeenCalledWith(EVM_ADDRESS, expect.anything());
+  });
+
+  it("encodes the TRON address when a TRON network is selected", async () => {
+    const f = withNetwork(both, "tron:3448148188");
+    const result = (await f.current.run(f.context as never, f.network as never, { qr: true })) as {
+      receiveAddress: string;
+    };
+
+    expect(result.receiveAddress).toBe(ADDRESS);
+  });
+
+  it("uses the configured default network when --network is omitted", async () => {
+    const f = withNetwork(both, undefined, "evm");
+    const result = (await f.current.run(f.context as never, f.network as never, { qr: true })) as {
+      receiveAddress: string;
+    };
+
+    expect(result.receiveAddress).toBe(EVM_ADDRESS);
+  });
+
+  it("refuses instead of falling back when the account has no address for that family", async () => {
+    const f = withNetwork({ evm: EVM_ADDRESS }, "tron:3448148188");
+
+    let code: string | undefined;
+    try {
+      await f.current.run(f.context as never, f.network as never, { qr: true });
+    } catch (e) {
+      code = (e as { code?: string }).code;
+    }
+
+    expect(code).toBe("family_mismatch");
+    expect(f.qr.encode).not.toHaveBeenCalled();
+  });
+
+  it("refuses under -o json too, not just in text", async () => {
+    const f = withNetwork({ evm: EVM_ADDRESS }, "tron:3448148188");
+    f.context.output = "json";
+
+    await expect(
+      f.current.run(f.context as never, f.network as never, { qr: true }),
+    ).rejects.toMatchObject({ code: "family_mismatch" });
+    expect(f.qr.encode).not.toHaveBeenCalled();
+  });
+
+  it("still shows a mismatched single-family account when --qr is absent", async () => {
+    const f = withNetwork({ evm: EVM_ADDRESS }, "tron:3448148188");
+
+    const result = await f.current.run(f.context as never, f.network as never, { qr: false });
+
+    expect(result).toMatchObject({ addresses: { evm: EVM_ADDRESS } });
   });
 });

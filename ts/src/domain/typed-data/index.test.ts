@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { normalizeTypedData } from "./index.js";
+import { normalizeTypedData, resolvePrimaryType } from "./index.js";
+import { CliError } from "../errors/index.js";
 
 const DOMAIN = { name: "SunPerp", version: "1", chainId: 728126428 };
 const TYPES = {
@@ -19,7 +20,6 @@ describe("normalizeTypedData", () => {
     expect(p).toEqual({ domain: DOMAIN, types: TYPES, message: { trader: "T1", size: "1" } });
   });
 
-  // MetaMask-style payloads include EIP712Domain in `types`; ethers' TypedDataEncoder throws on it.
   it("strips EIP712Domain from types", () => {
     const p = normalizeTypedData({
       domain: DOMAIN,
@@ -54,14 +54,72 @@ describe("normalizeTypedData", () => {
     expect(() => normalizeTypedData({ domain: "x", types: TYPES, message: {} })).toThrow(/domain/);
   });
 
+  it.each([
+    ["a function", { trader: () => "T1" }],
+    ["a class instance", { trader: new Date(0) }],
+    ["a non-finite number", { size: Number.NaN }],
+    ["a nested non-JSON member", { trader: { inner: [Symbol("x")] } }],
+  ])("rejects a message with %s", (_label, message) => {
+    expect(() => normalizeTypedData({ domain: DOMAIN, types: TYPES, message })).toThrow(/message/);
+  });
+
+  it("rejects a domain with a non-JSON member", () => {
+    expect(() =>
+      normalizeTypedData({ domain: { chainId: new Map() }, types: TYPES, message: {} }),
+    ).toThrow(/domain/);
+  });
+
+  it("accepts bigint uint values and nested JSON members", () => {
+    const message = { trader: "T1", size: 10n ** 30n, extra: { list: [1, true, null] } };
+    expect(normalizeTypedData({ domain: DOMAIN, types: TYPES, message }).message).toEqual(message);
+  });
+
+  it("drops undefined members so the payload holds only JSON values", () => {
+    const p = normalizeTypedData({
+      domain: { ...DOMAIN, salt: undefined },
+      types: TYPES,
+      message: { trader: "T1", size: "1", extra: { inner: undefined } },
+    });
+    expect(Object.keys(p.domain)).not.toContain("salt");
+    expect(p.message).toStrictEqual({ trader: "T1", size: "1", extra: {} });
+  });
+
+  it("rejects an undefined array element", () => {
+    expect(() =>
+      normalizeTypedData({ domain: DOMAIN, types: TYPES, message: { list: [1, undefined] } }),
+    ).toThrow(/message/);
+  });
+
   it("rejects a primaryType that is not declared", () => {
     expect(() =>
       normalizeTypedData({ domain: DOMAIN, types: TYPES, primaryType: "Nope", message: {} }),
     ).toThrow(/not declared in types/);
   });
 
-  // A nested (non-root) type is referenced by another struct, so it can never be what actually gets
-  // signed — ethers signs the root regardless. Reject it rather than sign one thing and report another.
+  it.each(["toString", "constructor", "hasOwnProperty"])(
+    "rejects the inherited member %s as an undeclared primaryType",
+    (primaryType) => {
+      expect(() =>
+        normalizeTypedData({ domain: DOMAIN, types: TYPES, primaryType, message: {} }),
+      ).toThrow(
+        expect.objectContaining({
+          code: "invalid_value",
+          message: expect.stringMatching(/not declared in types/),
+        }),
+      );
+    },
+  );
+
+  it("treats a field typed as an inherited member name as a non-struct type", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: { Mail: [{ name: "a", type: "constructor" }] },
+      primaryType: "Mail",
+      message: {},
+    });
+    expect(Object.keys(p.types)).toEqual(["Mail"]);
+  });
+
   const NESTED = {
     Outer: [
       { name: "who", type: "address" },
@@ -109,5 +167,172 @@ describe("normalizeTypedData", () => {
     expect(() =>
       normalizeTypedData({ domain: DOMAIN, types: { Order: [{ name: "x" }] }, message: {} }),
     ).toThrow(/without a name\/type/);
+  });
+
+  describe("missing top-level fields report invalid_payload, exit 2", () => {
+    const cases: Array<[string, unknown]> = [
+      ["whole payload not an object", "not an object"],
+      ["missing domain", { types: TYPES, message: {} }],
+      ["missing types", { domain: DOMAIN, message: {} }],
+      ["empty types (no struct besides EIP712Domain)", { domain: DOMAIN, types: {}, message: {} }],
+      ["missing message", { domain: DOMAIN, types: TYPES }],
+    ];
+
+    it.each(cases)("%s", (_label, raw) => {
+      let error: unknown;
+      try {
+        normalizeTypedData(raw);
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(CliError);
+      const cliError = error as CliError;
+      expect(cliError.code).toBe("invalid_payload");
+      expect(cliError.kind).toBe("usage");
+    });
+  });
+});
+
+describe("normalizeTypedData narrows types to the primaryType's closure", () => {
+  const Person = [
+    { name: "name", type: "string" },
+    { name: "wallet", type: "address" },
+  ];
+  const Mail = [
+    { name: "from", type: "Person" },
+    { name: "to", type: "Person" },
+    { name: "contents", type: "string" },
+  ];
+
+  it("drops a type the declared root never reaches", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: { Person, Mail, Unrelated: [{ name: "x", type: "uint256" }] },
+      primaryType: "Mail",
+      message: {},
+    });
+    expect(Object.keys(p.types).sort()).toEqual(["Mail", "Person"]);
+  });
+
+  it("keeps a second root when THAT is the one being signed", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: { Person, Mail, Receipt: [{ name: "id", type: "uint256" }] },
+      primaryType: "Receipt",
+      message: {},
+    });
+    expect(Object.keys(p.types)).toEqual(["Receipt"]);
+  });
+
+  it("follows array fields into the closure", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: {
+        Person,
+        Group: [{ name: "members", type: "Person[]" }],
+        Unrelated: [{ name: "x", type: "uint256" }],
+      },
+      primaryType: "Group",
+      message: {},
+    });
+    expect(Object.keys(p.types).sort()).toEqual(["Group", "Person"]);
+  });
+
+  it("follows fixed-size and nested array fields", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: {
+        Person,
+        Grid: [{ name: "rows", type: "Person[2][]" }],
+        Unrelated: [{ name: "x", type: "uint256" }],
+      },
+      primaryType: "Grid",
+      message: {},
+    });
+    expect(Object.keys(p.types).sort()).toEqual(["Grid", "Person"]);
+  });
+
+  it("still refuses a self-referencing type as the root", () => {
+    expect(() =>
+      normalizeTypedData({
+        domain: DOMAIN,
+        types: {
+          Node: [
+            { name: "value", type: "uint256" },
+            { name: "next", type: "Node" },
+          ],
+        },
+        primaryType: "Node",
+        message: {},
+      }),
+    ).toThrow(/not a root type/);
+  });
+
+  it("terminates on a cycle reached from the root", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: {
+        Root: [{ name: "a", type: "A" }],
+        A: [{ name: "b", type: "B" }],
+        B: [{ name: "a", type: "A" }],
+        Unrelated: [{ name: "x", type: "uint256" }],
+      },
+      primaryType: "Root",
+      message: {},
+    });
+    expect(Object.keys(p.types).sort()).toEqual(["A", "B", "Root"]);
+  });
+
+  it("leaves a payload whose types are all reachable untouched", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: { Person, Mail },
+      primaryType: "Mail",
+      message: {},
+    });
+    expect(p.types).toEqual({ Person, Mail });
+  });
+
+  it("leaves types alone when no primaryType is declared", () => {
+    const p = normalizeTypedData({
+      domain: DOMAIN,
+      types: { Person, Mail, Unrelated: [{ name: "x", type: "uint256" }] },
+      message: {},
+    });
+    expect(Object.keys(p.types).sort()).toEqual(["Mail", "Person", "Unrelated"]);
+  });
+});
+
+describe("resolvePrimaryType", () => {
+  const Person = [
+    { name: "name", type: "string" },
+    { name: "wallet", type: "address" },
+  ];
+  const Mail = [
+    { name: "from", type: "Person" },
+    { name: "to", type: "Person" },
+    { name: "contents", type: "string" },
+  ];
+
+  it("returns the declared primaryType without consulting types", () => {
+    expect(resolvePrimaryType({ types: { Mail, Person }, primaryType: "Mail" })).toBe("Mail");
+  });
+
+  it("infers the single root when primaryType is omitted", () => {
+    expect(resolvePrimaryType({ types: { Mail, Person } })).toBe("Mail");
+  });
+
+  it("returns undefined when more than one root exists and primaryType is omitted", () => {
+    expect(
+      resolvePrimaryType({ types: { Mail, Person, Receipt: [{ name: "id", type: "uint256" }] } }),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined when no root exists (a cycle with nothing outside it)", () => {
+    const types = {
+      A: [{ name: "b", type: "B" }],
+      B: [{ name: "a", type: "A" }],
+    };
+    expect(resolvePrimaryType({ types })).toBeUndefined();
   });
 });

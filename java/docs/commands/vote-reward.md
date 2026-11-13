@@ -14,14 +14,14 @@ Voting requires share. Share can be obtained by freezing funds.
 For example:
 
 ```console
-> freezeBalance 100000000 3 1 address  # Freeze 10TRX and acquire 10 units of shares
+> freezeBalance 10000000 3 1  # Freeze 10 TRX and acquire 10 units of shares
 
-> votewitness 123455 witness1 4 witness2 6  # Cast 4 votes for witness1 and 6 votes for witness2 at the same time
+> votewitness TJmka325yjJKeFpQDwKSQAoNwEyNGhsaEV 4 TFFLWM7tmKiwGtbh2mcz2rBssoFjHjSShG 6  # Cast 4 votes for the first SR and 6 for the second at the same time
 
-> votewitness 123455 witness1 10  # Voted 10 votes for witness1
+> votewitness TJmka325yjJKeFpQDwKSQAoNwEyNGhsaEV 10  # Vote 10 for the first SR only
 ```
 
-The final result of the above command was 10 votes for witness1 and 0 vote for witness2.
+Each SR must be given as a Base58Check address; a placeholder name is not accepted. The final result of the above commands was 10 votes for `TJmka325…` and 0 for `TFFLWM7t…`.
 
 ## Brokerage
 
@@ -86,7 +86,7 @@ After each block is produced, the block award is sent to the account's allowance
 
 ## How to create witness
 
-Applying to become a witness account needs to consume **100_000 TRX**. This part of the funds will be burned directly.
+Applying to become a witness account burns a registration fee — currently about **9,999 TRX**. The exact amount is the chain parameter `getAccountUpgradeCost`, which the network can change by proposal, so read it with `getchainparameters` rather than assuming a fixed value. The fee is burned outright and is not refundable; there is no way to unregister.
 
 ### CreateWitness
 
@@ -97,7 +97,7 @@ Apply to become a super representative candidate.
 ```
 
 ```console
-> CreateWitness TEDapYSVvAZ3aYH7w8N9tMEEFKaNKUD5Bp 007570646174654e616d6531353330363038383733343633
+> CreateWitness TEDapYSVvAZ3aYH7w8N9tMEEFKaNKUD5Bp https://sr.example.com
 ```
 
 ### UpdateWitness
@@ -105,7 +105,7 @@ Apply to become a super representative candidate.
 Edit the URL of the SR's official website.
 
 ```console
-> UpdateWitness TEDapYSVvAZ3aYH7w8N9tMEEFKaNKUD5Bp 007570646174654e616d6531353330363038383733343633
+> UpdateWitness TEDapYSVvAZ3aYH7w8N9tMEEFKaNKUD5Bp https://sr.example.com/v2
 ```
 
 ## ListWitnesses

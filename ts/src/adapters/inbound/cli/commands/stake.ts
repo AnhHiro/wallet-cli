@@ -2,10 +2,10 @@ import { z } from "zod";
 import type { NetworkDescriptor } from "../../../../domain/types/index.js";
 import type { ChainSpec, ExecutionContext, FamilyBinding } from "../contracts/index.js";
 import type { TronStakeService } from "../../../../application/use-cases/tron/stake-service.js";
-import { RESOURCES } from "../../../../domain/resources/index.js";
+import { RESOURCES } from "../../../../domain/tron/resources/index.js";
 import { Schemas } from "../schemas/index.js";
 import { ciEnum } from "../arity/index.js";
-import { txModeFields } from "./shared.js";
+import { txModeExclusive, txModeFields, tronTxModeFields } from "./shared.js";
 import { TextFormatters } from "../render/index.js";
 
 const resourceField = (description: string) =>
@@ -30,7 +30,7 @@ function stakeCommand(
   extra: z.ZodRawShape = {},
   options: StakeCommandOptions = {},
 ): { spec: ChainSpec; binding: FamilyBinding } {
-  const fields = z.object({ ...extra, ...txModeFields });
+  const fields = z.object({ ...extra, ...txModeFields, ...tronTxModeFields });
   return {
     spec: {
       path: ["stake", action],
@@ -42,6 +42,7 @@ function stakeCommand(
       summary,
       requires: options.requires,
       baseFields: fields,
+      exclusive: [txModeExclusive],
       baseRefine: options.refine,
       examples: [{ cmd: `wallet-cli stake ${action}` }],
       formatText: TextFormatters.txReceipt,
@@ -56,7 +57,7 @@ export function stakeDefinitions(
   return [
     stakeCommand(
       "freeze",
-      "Stake TRX for energy/bandwidth (FreezeBalanceV2)",
+      "Stake TRX for energy/bandwidth",
       (context, network, input) => service.freeze(context, network, input),
       {
         amountSun: Schemas.positiveIntString().describe("amount to freeze as staked TRX, in SUN"),
@@ -65,17 +66,15 @@ export function stakeDefinitions(
     ),
     stakeCommand(
       "unfreeze",
-      "Unstake TRX (UnfreezeBalanceV2)",
+      "Unstake TRX",
       (context, network, input) => service.unfreeze(context, network, input),
       {
         amountSun: Schemas.positiveIntString().describe("amount to unfreeze as staked TRX, in SUN"),
         resource: resourceField("resource type to release"),
       },
     ),
-    stakeCommand(
-      "withdraw",
-      "Withdraw expired unfrozen TRX (WithdrawExpireUnfreeze)",
-      (context, network, input) => service.withdraw(context, network, input),
+    stakeCommand("withdraw", "Withdraw expired unfrozen TRX", (context, network, input) =>
+      service.withdraw(context, network, input),
     ),
     stakeCommand(
       "cancel-unfreeze",
@@ -83,8 +82,7 @@ export function stakeDefinitions(
       (context, network, input) => service.cancelUnfreeze(context, network, input),
       {},
       {
-        // The Ledger TRON app firmware rejects CancelAllUnfreezeV2Contract (APDU 0x6a80),
-        // even with blind-signing enabled; software accounts sign it fine.
+        // Ledger rejects this contract type even with blind signing enabled.
         requires: [
           "a software (non-Ledger) account — the Ledger TRON app cannot sign this transaction type",
         ],
@@ -92,7 +90,7 @@ export function stakeDefinitions(
     ),
     stakeCommand(
       "delegate",
-      "Delegate resource to another address (DelegateResourceV2)",
+      "Delegate resource to another address",
       (context, network, input) => service.delegate(context, network, input),
       {
         amountSun: Schemas.positiveIntString().describe(
@@ -125,7 +123,7 @@ export function stakeDefinitions(
     ),
     stakeCommand(
       "undelegate",
-      "Reclaim delegated resource (UnDelegateResourceV2)",
+      "Reclaim delegated resource",
       (context, network, input) => service.undelegate(context, network, input),
       {
         amountSun: Schemas.positiveIntString().describe(

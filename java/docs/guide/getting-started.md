@@ -9,13 +9,13 @@ Build, create an account, and send your first transfer — all from the interact
 ```console
 # 1. Build
 $ git clone https://github.com/tronprotocol/wallet-cli.git
-$ cd wallet-cli && ./gradlew build && cd build/libs
+$ cd wallet-cli/java && ./gradlew build && cd build/libs
 
 # 2. Start the interactive wallet
 $ java -jar wallet-cli.jar
 
 # 3. In the wallet prompt: create an account (or ImportWallet), unlock, and inspect it
-> RegisterWallet 123456      # create a keystore with password 123456
+> RegisterWallet             # prompts twice for the password, then for mnemonic length
 > Login                      # unlock the account
 > GetAddress                 # show your address
 > GetBalance                 # TRX balance
@@ -28,7 +28,7 @@ $ java -jar wallet-cli.jar
 
 ## How to create account
 
-You can create accounts by transferring funds to non-existing accounts, or by initiating a transaction to create an account using the **CreateAccount** command. Transferring to a non-existent account has a minimum restriction amount of **1 TRX**. Creating an account through the `CreateAccount` command still burns **1 TRX**.
+You can create accounts by transferring funds to non-existing accounts, or by initiating a transaction to create an account using the **CreateAccount** command. Either way the payer burns `getCreateNewAccountFeeInSystemContract` (**1 TRX** on mainnet today); the transaction's bandwidth comes from the payer's staked bandwidth, and only if that is insufficient is `getCreateAccountFee` (**0.1 TRX**) burned as well — so 1 to 1.1 TRX in total. See [Account commands](../commands/account.md#how-to-create-account).
 
 See [commands/account](../commands/account.md) for the full `CreateAccount` example.
 

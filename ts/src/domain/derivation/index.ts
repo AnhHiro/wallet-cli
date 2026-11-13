@@ -1,7 +1,3 @@
-/**
- * Derivation — BIP39 mnemonic/seed plus BIP44 HD derivation.
- * secp256k1 is shared by both families; only the coin type differs.
- */
 import {
   mnemonicToSeedSync,
   generateMnemonic,
@@ -25,12 +21,11 @@ export class Derivation {
     return validateMnemonic(mnemonic.trim(), wordlist);
   }
 
-  /** BIP39 mnemonic → 64-byte seed, with optional passphrase. */
+  // Returns a 64-byte BIP39 seed.
   static mnemonicToSeed(mnemonic: string, passphrase?: string): Bytes {
     return mnemonicToSeedSync(mnemonic.trim(), passphrase);
   }
 
-  /** entropy (the value persisted in a vault) ↔ mnemonic. */
   static mnemonicToEntropy(mnemonic: string): Bytes {
     return mnemonicToEntropy(mnemonic.trim(), wordlist);
   }
@@ -38,23 +33,39 @@ export class Derivation {
     return entropyToMnemonic(entropy, wordlist);
   }
 
-  /** m/44'/{coin}'/{account}'/0/0 */
-  static path(family: ChainFamily, account: number): string {
-    return `m/44'/${FAMILIES[family].coinType}'/${account}'/0/0`;
+  // Software wallets increment address_index for default restore compatibility.
+  static path(family: ChainFamily, index: number): string {
+    return `m/44'/${FAMILIES[family].coinType}'/0'/0/${index}`;
   }
 
-  /** Derive a keypair from a 64-byte seed at the given BIP44 path. publicKey is uncompressed (65B). */
+  // Ledger Live increments the hardened account index.
+  static ledgerPath(family: ChainFamily, index: number): string {
+    return `m/44'/${FAMILIES[family].coinType}'/${index}'/0/0`;
+  }
+
+  // Alternate account-level TRON path for identifying imported accounts.
+  static legacyPaths(family: ChainFamily, index: number): string[] {
+    if (family !== "tron" || index === 0) return [];
+    return [`m/44'/195'/${index}'/0/0`];
+  }
+
+  // Accepts a 64-byte seed; returns a 65-byte uncompressed public key.
   static derive(seed: Bytes, path: string): KeyPair {
     const node = HDKey.fromMasterSeed(seed).derive(path);
     if (!node.privateKey)
       throw new WalletError("encoding_error", `cannot derive private key at ${path}`);
     const privateKey = node.privateKey;
-    const publicKey = secp256k1.getPublicKey(privateKey, false); // uncompressed
+    const publicKey = secp256k1.getPublicKey(privateKey, false);
     return { privateKey, publicKey };
   }
 
-  /** raw private key → uncompressed public key (for privateKey-source wallets). */
+  // Returns a 65-byte uncompressed public key.
   static publicKeyFromPrivate(privateKey: Bytes): Bytes {
     return secp256k1.getPublicKey(privateKey, false);
+  }
+
+  // Checks for a 32-byte secp256k1 scalar in [1, n-1].
+  static isValidPrivateKey(privateKey: Bytes): boolean {
+    return secp256k1.utils.isValidSecretKey(privateKey);
   }
 }

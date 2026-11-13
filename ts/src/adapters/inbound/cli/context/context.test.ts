@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { buildExecutionContext, RuntimeDeps } from "./index.js";
 import { StreamManager } from "../stream/index.js";
 import { createOutputFormatter } from "../output/index.js";
@@ -15,7 +15,7 @@ function ctxWith(output: "text" | "json", overrides: Partial<Globals> = {}) {
   );
   const formatter = createOutputFormatter(output, sm, 0);
   const globals = { output, verbose: false, ...overrides } as Globals;
-  // only streams + formatter are exercised by emit(); the rest is lazily used elsewhere.
+  // These tests do not resolve a stored account.
   const deps = { config: { timeoutMs: 1 }, streams: sm, formatter } as unknown as RuntimeDeps;
   return { ctx: buildExecutionContext(globals, deps), out, err };
 }
@@ -35,11 +35,38 @@ describe("ExecutionContext.emit (progress events)", () => {
   });
 });
 
-describe("ExecutionContext direct address target", () => {
-  it("resolves a valid --account address without requiring a local wallet record", () => {
-    const address = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
-    const { ctx } = ctxWith("json", { account: address });
-    expect(ctx.activeAccount).toBe(address);
-    expect(ctx.resolveAddress("tron")).toBe(address);
+describe("ExecutionContext account selection", () => {
+  function ctxWithAccounts(account?: string) {
+    const sm = new StreamManager(
+      "json",
+      false,
+      () => {},
+      () => {},
+    );
+    const accounts = {
+      selectAccount: vi.fn((requested?: string) => requested ?? "wlt_a.0"),
+      accountAddress: vi.fn((selected: string, family: string) => `${family}:${selected}`),
+    };
+    const deps = {
+      config: { timeoutMs: 1 },
+      streams: sm,
+      formatter: createOutputFormatter("json", sm, 0),
+      accounts,
+    } as unknown as RuntimeDeps;
+    const globals = { output: "json", verbose: false, account } as Globals;
+    return { ctx: buildExecutionContext(globals, deps), accounts };
+  }
+
+  it("asks the account use case once, with the --account value", () => {
+    const { ctx, accounts } = ctxWithAccounts("main");
+    expect(ctx.activeAccount).toBe("main");
+    expect(ctx.activeAccount).toBe("main");
+    expect(accounts.selectAccount).toHaveBeenCalledExactlyOnceWith("main");
+  });
+
+  it("resolves an address through the selected account", () => {
+    const { ctx, accounts } = ctxWithAccounts();
+    expect(ctx.resolveAddress("tron")).toBe("tron:wlt_a.0");
+    expect(accounts.accountAddress).toHaveBeenCalledWith("wlt_a.0", "tron");
   });
 });

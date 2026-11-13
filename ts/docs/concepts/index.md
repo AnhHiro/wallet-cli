@@ -1,11 +1,11 @@
 # Concepts
 
-How TRON and wallet-cli work underneath the commands. Read these once and the command pages stop feeling arbitrary.
+How the chains and wallet-cli work underneath the commands. Read these once and the command pages stop feeling arbitrary.
 
 | Concept | What it explains |
 |---|---|
-| [Networks](networks.md) | Canonical network ids (`tron:mainnet` / `tron:nile` / `tron:shasta`) and how a command picks one |
-| [Accounts and HD wallets](accounts-and-hd.md) | Seeds, derived accounts, account types, the active account, backup and delete |
+| [Networks](networks.md) | Canonical CAIP-2 network ids and their aliases, the two chain families, how a command picks a network, and the two fee models |
+| [Accounts and HD wallets](accounts-and-hd.md) | Seeds, derived accounts, one address per chain family, account types, the active account, backup and delete |
 | [Energy and bandwidth](energy-bandwidth.md) | TRON's fee model and why `stake` exists |
 | [Security model](security.md) | Key storage, secret handling, recovery, and what remains your responsibility |
 

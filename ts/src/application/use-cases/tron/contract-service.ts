@@ -1,11 +1,27 @@
-import type { NetworkDescriptor } from "../../../domain/types/index.js";
+import { requestDispatchCheck } from "../../services/command-deadline.js";
+import { systemWallClock, type WallClock } from "../../contracts/wall-clock.js";
+import type { ExecutionDeadline } from "../../contracts/deadline.js";
+import { currentTronEnergyPrice } from "../../../domain/tron/tron-energy-price.js";
+import {
+  isOriginEnergyLimit,
+  MAX_ORIGIN_ENERGY_LIMIT,
+  percent,
+} from "../../../domain/tron/governance/limits.js";
 import type { TransactionScope } from "../../contracts/execution-scope.js";
 import type { ChainGatewayProvider } from "../../ports/chain/gateway-provider.js";
-import type { TronContractParameter } from "../../ports/chain/tron-gateway.js";
+import type {
+  TronContractParameter,
+  TronFeeEstimate,
+  TronGateway,
+} from "../../ports/chain/tron/tron-gateway.js";
 import type { TxPipeline } from "../../services/pipeline/index.js";
-import { ChainError } from "../../../domain/errors/index.js";
-import { computeTronCreate2Address } from "../../../domain/governance/create2.js";
-import type { UnsignedTx } from "../../../domain/types/index.js";
+import { ChainError, UsageError } from "../../../domain/errors/index.js";
+import { computeTronCreate2Address } from "../../../domain/tron/governance/create2.js";
+import type {
+  NetworkDescriptor,
+  TronTransactionArtifact,
+  UnsignedTx,
+} from "../../../domain/types/index.js";
 import {
   governanceTransactionMode,
   transactionResource,
@@ -16,17 +32,21 @@ import {
   transactionMode,
   transactionRequiresSigner,
 } from "../../services/transaction-mode.js";
-import { tronConfirmation } from "../../services/tron-confirmation.js";
+import { tronConfirmation } from "../../services/tron/tron-confirmation.js";
 import { tronHexToBase58 } from "../../../domain/address/index.js";
+import { fromBaseUnits, type Sun } from "../../../domain/amounts/index.js";
+import { approveRows, type ApprovalKind } from "../../services/approve-receipt.js";
 import { tronTransactionHooks } from "./multisig-authorization.js";
 
 export class TronContractService {
   constructor(
     private readonly gateways: ChainGatewayProvider,
     private readonly pipeline: TxPipeline,
+    private readonly now: WallClock = systemWallClock,
   ) {}
 
   async call(
+    deadline: ExecutionDeadline,
     network: NetworkDescriptor,
     contract: string,
     method: string,
@@ -36,7 +56,7 @@ export class TronContractService {
       contract,
       method,
       result: await this.gateways
-        .get(network, "tron")
+        .get(network, "tron", requestDispatchCheck(deadline))
         .triggerConstantContract(contract, method, parameters),
     };
   }
@@ -47,20 +67,37 @@ export class TronContractService {
     input: GovernanceTransactionInput & {
       contract: string;
       method: string;
+      // Distinguishes token allowances from NFT approvals with the same signature.
+      approvalKind?: ApprovalKind;
       parameters: TronContractParameter[];
-      callValueSun: string;
-      feeLimit: string;
+      callValueSun: Sun;
+      feeLimit: Sun;
     },
   ) {
     if (transactionRequiresSigner(input)) this.pipeline.assertCanSign(scope.activeAccount, "tron");
-    const gateway = this.gateways.get(network, "tron");
-    const outcome = await this.pipeline.run({
+    const gateway = this.gateways.get(network, "tron", requestDispatchCheck(scope.deadline));
+    // Resolve approval details before the pipeline so dry runs include the allowance.
+    const approval = await approveRows({
+      method: input.method,
+      params: input.parameters,
+      approvalKind: input.approvalKind,
+      metadata: () =>
+        gateway.getTokenInfo(input.contract).then((info) => ({
+          decimals: info.decimals ?? info.precision,
+          symbol: info.symbol,
+        })),
+      // Node addresses may use 41-prefixed hex.
+      displayAddress: tronHexToBase58,
+      fromBaseUnits,
+    });
+    const outcome = await this.pipeline.runTron({
       ctx: scope,
       net: network,
       account: scope.activeAccount,
       broadcaster: gateway,
       ...transactionMode(input),
-      ...tronTransactionHooks(gateway),
+      ...tronTransactionHooks(gateway, this.now),
+      preflight: null,
       confirm: tronConfirmation(gateway, scope),
       build: async (from) =>
         gateway.triggerSmartContract(from, input.contract, input.method, input.parameters, {
@@ -74,6 +111,7 @@ export class TronContractService {
           input.contract,
           input.method,
           input.parameters,
+          input.callValueSun,
         );
         warnIfFeeLimitLikelyInsufficient(scope, input.feeLimit, estimate);
         return estimate;
@@ -82,6 +120,7 @@ export class TronContractService {
     return {
       kind: "contract-send" as const,
       ...outcomeData(outcome),
+      ...approval,
       method: input.method,
       contract: input.contract,
     };
@@ -93,31 +132,29 @@ export class TronContractService {
     input: GovernanceTransactionInput & {
       abi: unknown;
       bytecode: string;
-      feeLimit: string;
+      feeLimit: Sun;
       parameters: unknown[];
     },
   ) {
-    // Ledger TRON app firmware cannot sign a CreateSmartContract tx — reject before any device I/O.
+    // Ledger cannot sign CreateSmartContract; reject before device I/O.
     if (transactionRequiresSigner(input)) {
       this.pipeline.assertCanSign(scope.activeAccount, "tron", { requireSoftware: true });
     }
-    const gateway = this.gateways.get(network, "tron");
-    const hooks = tronTransactionHooks(gateway);
+    const gateway = this.gateways.get(network, "tron", requestDispatchCheck(scope.deadline));
+    const hooks = tronTransactionHooks(gateway, this.now);
     let contractAddress: string | undefined;
-    const outcome = await this.pipeline.run({
+    const outcome = await this.pipeline.runTron({
       ctx: scope,
       net: network,
       account: scope.activeAccount,
       broadcaster: gateway,
       ...transactionMode(input),
       ...hooks,
-      // TRON derives the deployed address from the final txID, and `prepare` recomputes that txID
-      // when it binds --permission-id / --expiration. Read the address from the prepared
-      // transaction, never from the builder output, or we report a contract nobody deploys.
+      preflight: null,
+      // Preparation changes txID and therefore the deployed address.
       prepare: (transaction, options) => {
         const prepared = hooks.prepare(transaction, options);
-        const hex = (prepared as { contract_address?: string }).contract_address;
-        contractAddress = hex ? tronHexToBase58(hex) : undefined;
+        contractAddress = gateway.deployedContractAddress(prepared);
         return prepared;
       },
       signerOptions: { requireSoftware: true },
@@ -131,8 +168,10 @@ export class TronContractService {
     return { kind: "contract-deploy" as const, contractAddress, ...outcomeData(outcome) };
   }
 
-  async info(network: NetworkDescriptor, address: string) {
-    const metadata = await this.gateways.get(network, "tron").getContractMetadata(address);
+  async info(deadline: ExecutionDeadline, network: NetworkDescriptor, address: string) {
+    const metadata = await this.gateways
+      .get(network, "tron", requestDispatchCheck(deadline))
+      .getContractMetadata(address);
     return {
       address,
       name: metadata.name,
@@ -164,6 +203,12 @@ export class TronContractService {
     network: NetworkDescriptor,
     input: GovernanceTransactionInput & { address: string; energy: number | string },
   ) {
+    if (!isOriginEnergyLimit(input.energy)) {
+      throw new UsageError(
+        "invalid_value",
+        `origin energy limit must be an integer from 1 to ${MAX_ORIGIN_ENERGY_LIMIT}`,
+      );
+    }
     return this.govern(
       scope,
       network,
@@ -182,16 +227,17 @@ export class TronContractService {
     network: NetworkDescriptor,
     input: GovernanceTransactionInput & { address: string; percent: number },
   ) {
+    const userPercent = percent(input.percent, "user resource percent");
     return this.govern(
       scope,
       network,
       input,
       "contract-set-user-resource-percent",
       (gateway, owner) =>
-        gateway.buildUpdateUserResourcePercent(owner, input.address, input.percent, {
+        gateway.buildUpdateUserResourcePercent(owner, input.address, userPercent, {
           permissionId: input.permissionId,
         }),
-      { consumeUserResourcePercent: input.percent },
+      { consumeUserResourcePercent: userPercent },
     );
   }
 
@@ -207,14 +253,11 @@ export class TronContractService {
       | "contract-clear-abi"
       | "contract-set-origin-energy-limit"
       | "contract-set-user-resource-percent",
-    build: (gateway: ReturnType<ChainGatewayProvider["get"]>, owner: string) => Promise<UnsignedTx>,
+    build: (gateway: TronGateway, owner: string) => Promise<TronTransactionArtifact>,
     fields: Record<string, unknown>,
   ) {
-    const gateway = this.gateways.get(network, "tron");
-    // ClearABIContract / UpdateEnergyLimitContract / UpdateSettingContract are all absent from the
-    // Ledger TRON app's contract-type allowlist, so the device cannot parse any of them (APDU
-    // 0x6a80). Refuse before the unlock prompt and before any RPC — docs/adr/0003. `send` above is
-    // deliberately ungated: TriggerSmartContract IS allowlisted.
+    const gateway = this.gateways.get(network, "tron", requestDispatchCheck(scope.deadline));
+    // Ledger cannot sign ClearABIContract, UpdateEnergyLimitContract, or UpdateSettingContract.
     const mode = governanceTransactionMode(this.pipeline, scope, input, { requireSoftware: true });
     const owner = scope.resolveAddress("tron");
     let metadata;
@@ -232,14 +275,15 @@ export class TronContractService {
         `only contract deployer ${metadata.originAddress ?? "(unknown)"} may govern ${input.address}`,
       );
     }
-    const outcome = await this.pipeline.run({
+    const outcome = await this.pipeline.runTron({
       ctx: scope,
       net: network,
       account: scope.activeAccount,
       broadcaster: gateway,
       ...mode,
       confirm: tronConfirmation(gateway, scope),
-      ...tronTransactionHooks(gateway),
+      ...tronTransactionHooks(gateway, this.now),
+      preflight: null,
       build: async (address) => await build(gateway, address),
       estimate: async (_tx: UnsignedTx) => ({
         feeModel: "tron-resource",
@@ -266,8 +310,8 @@ function exactIntegerView(value: number | string): number | string {
 
 function warnIfFeeLimitLikelyInsufficient(
   scope: TransactionScope,
-  feeLimit: string,
-  estimate: Record<string, unknown>,
+  feeLimit: Sun,
+  estimate: TronFeeEstimate,
 ): void {
   const energy = positiveInteger(estimate.energy);
   const energyPriceSun = currentEnergyPrice(estimate.energyPriceSun);
@@ -297,7 +341,6 @@ function positiveInteger(value: unknown): bigint | undefined {
 }
 
 function currentEnergyPrice(value: unknown): bigint | undefined {
-  if (typeof value !== "string") return undefined;
-  const latest = value.split(",").at(-1)?.split(":");
-  return latest?.length === 2 ? positiveInteger(latest[1]) : undefined;
+  const price = currentTronEnergyPrice(value);
+  return price === undefined ? undefined : BigInt(price);
 }

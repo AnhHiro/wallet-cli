@@ -1,14 +1,6 @@
-/**
- * HelpService — --help / --version / --json-schema. Zod-driven: every flag's help,
- * required/optional/default, examples, and the agent JSON-schema come from the command's
- * zod fields/input; one schema supplies validation, types, help, and agent schema.
- *
- * Two command kinds, discriminated by `family`: neutral (full path) and chain (logical path,
- * per-family impls). A leading family token (e.g. tron) is an optional addressing prefix here.
- */
-import { z, type ZodObject, type ZodRawShape } from "zod";
+import { z } from "zod";
 import type { ChainFamily, ExitCode } from "../../../../domain/types/index.js";
-import { isChainCommand } from "../contracts/index.js";
+import { acceptsWaitFlags, isChainCommand } from "../contracts/index.js";
 import type {
   ChainCommandDefinition,
   ChainSpec,
@@ -17,8 +9,18 @@ import type {
   StreamManager,
 } from "../contracts/index.js";
 import { CommandRegistry } from "../registry/index.js";
+import { CONFIG_DEFAULTS } from "../../../../application/contracts/config-defaults.js";
+import { MAX_TIMEOUT_MS } from "../../../../domain/config/index.js";
+import { UsageError } from "../../../../domain/errors/index.js";
 import { introspectFields, type FieldInfo } from "../arity/index.js";
-import { GLOBAL_FLAGS, type GlobalFlag, inputFlagsFor, buildCatalog } from "./catalog.js";
+import {
+  GLOBAL_FLAGS,
+  type CapabilitySupportSource,
+  type GlobalFlag,
+  inputFlagsFor,
+  buildCatalog,
+  mergedFields,
+} from "./catalog.js";
 
 const META = new Set(["--help", "-h", "--version", "-V", "--json-schema"]);
 
@@ -31,6 +33,7 @@ export class HelpService {
     private readonly registry: CommandRegistry,
     private readonly streams: StreamManager,
     private readonly version: string,
+    private readonly capabilities?: CapabilitySupportSource,
   ) {}
 
   handleMeta(tokens: string[]): ExitCode {
@@ -44,12 +47,11 @@ export class HelpService {
 
     if (tokens.includes("--json-schema")) {
       if (concrete) {
-        const input = isChainCommand(concrete) ? mergedFields(concrete) : concrete.input;
+        const input = isChainCommand(concrete) ? mergedFields(concrete, family) : concrete.input;
         this.streams.result(JSON.stringify(z.toJSONSchema(input)));
         return 0;
       }
-      // no concrete command → machine catalog (every command + flags), optionally scoped to a
-      // chain family (`tron --json-schema`). Mirrors the help tree.
+      this.#assertResolvable(family, path);
       this.streams.result(this.#catalog(family));
       return 0;
     }
@@ -62,15 +64,22 @@ export class HelpService {
       );
       return 0;
     }
-    if (!family && path.length === 1 && this.#isNeutralGroup(path[0]!)) {
-      this.streams.result(this.#renderNeutralGroup(path[0]!));
-      return 0;
-    }
+    this.#assertResolvable(family, path);
     this.streams.result(this.#renderTree(path[0]));
     return 0;
   }
 
-  /** strip an optional leading family token (e.g. tron) — a help/catalog addressing prefix. */
+  #assertResolvable(family: ChainFamily | undefined, path: string[]): void {
+    if (path.length === 0) return;
+    const head = path[0]!;
+    if (path.length === 1 && (this.#isChainGroup(head) || this.#isNeutralGroup(head))) return;
+
+    if (family && this.registry.resolveChain(path)) {
+      throw new UsageError("family_mismatch", `${path.join(" ")} has no ${family} implementation`);
+    }
+    throw new UsageError("unknown_command", `unknown command: ${path.join(" ")}`);
+  }
+
   #split(positionals: string[]): { family?: ChainFamily; path: string[] } {
     const head = positionals[0];
     if (head && (this.registry.families() as string[]).includes(head)) {
@@ -79,16 +88,16 @@ export class HelpService {
     return { path: positionals };
   }
 
-  /** resolve to a single command: a neutral command by full path, or a family-pinned chain command. */
+  // Match the longest command prefix; trailing tokens may be argument values, but groups do not count.
   #resolveConcrete(family: ChainFamily | undefined, path: string[]): StoredCommand | null {
-    if (path.length === 0) return null;
-    const chain = this.registry.resolveChain(path);
-    if (chain && (!family || chain.families[family])) return chain;
-    const chainHeadLeaf = this.registry.resolveChain([path[0]!]);
-    if (chainHeadLeaf && (!family || chainHeadLeaf.families[family])) return chainHeadLeaf;
-    if (family) return null;
-    const neutral = this.registry.resolveNeutral(path);
-    if (neutral) return neutral;
+    for (let end = path.length; end > 0; end -= 1) {
+      const prefix = path.slice(0, end);
+      const chain = this.registry.resolveChain(prefix);
+      if (chain && (!family || chain.families[family])) return chain;
+      if (family) continue;
+      const neutral = this.registry.resolveNeutral(prefix);
+      if (neutral) return neutral;
+    }
     return null;
   }
 
@@ -99,9 +108,6 @@ export class HelpService {
     return this.#renderRoot();
   }
 
-  /** top-level overview: first release presents TRON as the product surface.
-   * Docker-style three groups: Common (high-frequency entry points) / Management (on-chain resource
-   * nouns) / Commands (local governance). */
   #renderRoot(): string {
     const common = [
       ["create", "Create a new HD wallet (BIP39 seed)", ""],
@@ -109,27 +115,36 @@ export class HelpService {
       ["list", "List wallets / accounts", ""],
     ] as const;
     const management = [
-      ["account", "Query on-chain account state, activate & name accounts", ""],
-      ["permission", "View and update account multi-sign permissions", "tron"],
+      ["account", "Query on-chain account state", ""],
+      ["permission", "View / update account permissions (multi-sig)", "tron"],
       ["token", "Manage the token address book and query tokens", ""],
-      ["asset", "Issue and manage TRC10 tokens", "tron"],
-      ["exchange", "Create and trade Bancor exchange pairs", "tron"],
       ["tx", "Build, send, broadcast, and inspect transactions", ""],
-      ["contract", "Call, deploy, govern, and inspect smart contracts", ""],
       ["gasfree", "Gas-free token transfers via the GasFree service", "tron"],
-      ["proposal", "Create and vote on governance proposals", "tron"],
-      ["witness", "Register and operate an SR candidacy", "tron"],
+      [
+        "sunswap",
+        "Swap, manage liquidity, and look up pools, positions and prices on SunSwap",
+        "tron",
+      ],
+      ["sunpump", "Create and trade tokens on the SunPump bonding curve", "tron"],
+      ["contract", "Call, deploy, govern, and inspect smart contracts", ""],
+      ["proposal", "Create / vote on governance proposals", "tron"],
+      ["witness", "Register / operate a super representative", "tron"],
+      ["asset", "Issue & manage TRC10 tokens", "tron"],
+      ["exchange", "Create and trade Bancor exchange pairs", "tron"],
       ["stake", "Stake / delegate resources & query state", "tron"],
       ["vote", "Vote for super representatives", "tron"],
       ["reward", "Query / withdraw voting rewards", "tron"],
-      ["chain", "Query chain params, prices & node info", "tron"],
+      ["chain", "Query chain and node state", ""],
       ["message", "Sign arbitrary messages", ""],
       ["typed-data", "Sign EIP-712 / TIP-712 structured data", ""],
       ["block", "Get a block (latest if omitted)", ""],
+      ["x402", "Pay and inspect x402 service providers", ""],
+      ["bai", "Query and recharge a B.AI account", ""],
+      ["8004", "Read and manage ERC-8004 Agent identities", ""],
     ] as const;
     const commands = [
       ["use", "Set the active account", ""],
-      ["current", "Show the current account (--qr for a receive QR code)", ""],
+      ["current", "Show the current (active) account", ""],
       ["rename", "Rename an account label", ""],
       ["derive", "Derive the next HD account from a seed wallet", ""],
       ["backup", "Export an account's secret + metadata (0600)", ""],
@@ -137,18 +152,17 @@ export class HelpService {
       ["config", "Show / get / set configuration values", ""],
       ["networks", "List known networks", ""],
       ["change-password", "Change the master password (re-encrypt keystores)", ""],
-      ["encoding", "Convert / validate addresses & encodings across formats", ""],
+      ["encoding", "Convert / validate addresses & encodings", ""],
       ["address", "Generate a random keypair (local, not stored)", ""],
       ["contact", "Manage the recipient address book", ""],
     ] as const;
     const sections = [common, management, commands] as const;
     const nameWidth = Math.max(...sections.flat().map(([name]) => name.length)) + 2;
-    // chain-only groups carry a right-hand (family) tag; align it past the widest description.
     const tagCol = Math.max(...sections.flat().map(([, desc]) => desc.length)) + 2;
     const commandRow = (name: string, desc: string, tag: string): string => {
       const body = `  ${name.padEnd(nameWidth)}${dim(desc)}`;
       return tag
-        ? `${body}${" ".repeat(Math.max(2, tagCol - desc.length))}(${tag})`
+        ? `${body}${" ".repeat(Math.max(2, tagCol - desc.length))}(${tag.toUpperCase()} only)`
         : body.trimEnd();
     };
     const row =
@@ -157,20 +171,30 @@ export class HelpService {
         `  ${name.padEnd(width)}${desc ? dim(desc) : ""}`.trimEnd();
     const optionRows = [
       ["-o, --output string", 'Output format ("text", "json") (default from config)'],
-      ["--network string", 'Canonical network id, e.g. "tron:mainnet", "tron:nile", "tron:shasta"'],
+      ["--network string", 'Network id or alias, e.g. "tron", "ethereum", "sepolia"'],
       ["--account string", "Account label or address to act as (overrides active)"],
-      ["--timeout int", "Request timeout in milliseconds"],
+      [
+        "--timeout int",
+        `Deadline for the whole command in milliseconds (0-${MAX_TIMEOUT_MS}); 0 = no limit (default from config timeoutMs, built-in ${CONFIG_DEFAULTS.timeoutMs})`,
+      ],
+      [
+        "--wait",
+        "Wait until the submitted transaction is confirmed or failed, within the deadline (default where a transaction is submitted)",
+      ],
+      [
+        "--no-wait",
+        "Return after submission without waiting for confirmation; approvals still wait",
+      ],
       ["-v, --verbose", "Verbose / debug logging"],
       ["-h, --help", "Show help"],
       ["-V, --version", "Print version information and quit"],
     ] as const;
     const optionRow = row(Math.max(...optionRows.map(([name]) => name.length)) + 2);
 
-    // Usage first, description after; root Usage is the inline form.
     const lines = [
       `${bold("Usage:")}  wallet-cli [OPTIONS] COMMAND`,
       "",
-      `${bold("wallet-cli")} — CLI wallet for TRON.`,
+      `${bold("wallet-cli")} — CLI wallet for TRON and EVM networks.`,
       "Agent-first: deterministic exit codes, JSON output.",
       "",
       bold("Common Commands:"),
@@ -189,31 +213,44 @@ export class HelpService {
     return lines.join("\n");
   }
 
-  /** neutral group (`import --help`): list the group's sub-commands. Derived from the registry. */
   #renderNeutralGroup(head: string): string {
     const cmds = this.#neutralGroupCommands(head);
-    const rows = cmds.map((c) => [c.path[1] ?? "", c.summary ?? ""] as const);
+    const rows = cmds.map((c) => [c.path[1] ?? "", c.summary ?? "", ""] as const);
     return this.#renderGroup(head, rows);
   }
 
-  /** logical resource group (`account --help`): default surface, implementations chosen by --network/defaultNetwork. */
   #renderLogicalNs(group: string): string {
     const commands = this.#chainGroupCommands(group);
-    const rows = commands.map((c) => [c.path[1] ?? "", c.summary ?? ""] as const);
-    return this.#renderGroup(group, rows);
+    const neutral = this.#neutralGroupCommands(group);
+    const tags = commands.map((c) => groupRowTag(c.families));
+    // Uniform family tags are already shown on the root group row.
+    const uniform =
+      neutral.length === 0 && tags.length > 0 && tags.every((t) => t !== "" && t === tags[0]);
+    const rows = commands.map(
+      (c, i) => [c.path[1] ?? "", c.summary ?? "", uniform ? "" : tags[i]!] as const,
+    );
+    return this.#renderGroup(group, [
+      ...rows,
+      ...neutral.map((c) => [c.path[1] ?? "", c.summary ?? "", ""] as const),
+    ]);
   }
 
-  /** shared group skeleton: inline Usage → description → verb list → footer. */
-  #renderGroup(group: string, rows: ReadonlyArray<readonly [string, string]>): string {
-    // Width is the longest verb, uncapped: a cap cannot shorten an over-long verb, it only stops
-    // padEnd from reaching it — so every summary in the group loses its column the moment one verb
-    // exceeds the cap (`contract set-user-resource-percent`, 25 chars, did exactly that).
+  #renderGroup(group: string, rows: ReadonlyArray<readonly [string, string, string]>): string {
+    // Capping the width would misalign summaries after long verbs.
     const width = Math.max(0, ...rows.map(([verb]) => verb.length)) + 2;
+    const tagCol = Math.max(0, ...rows.map(([, summary]) => summary.length)) + 2;
     const lines = [`${bold("Usage:")}  wallet-cli ${group} COMMAND`, ""];
     const desc = GROUP_DESCRIPTIONS[group];
     if (desc) lines.push(desc, "");
     lines.push(bold("Commands:"));
-    for (const [verb, summary] of rows) lines.push(`  ${verb.padEnd(width)} ${summary}`.trimEnd());
+    for (const [verb, summary, tag] of rows) {
+      const body = `  ${verb.padEnd(width)} ${summary}`;
+      lines.push(
+        tag
+          ? `${body}${" ".repeat(Math.max(2, tagCol - summary.length))}(${tag.toUpperCase()} only)`
+          : body.trimEnd(),
+      );
+    }
     lines.push("", `Run 'wallet-cli ${group} COMMAND --help' for more information on a command.`);
     return lines.join("\n");
   }
@@ -227,6 +264,7 @@ export class HelpService {
       auth: cmd.auth,
       wallet: cmd.wallet,
       broadcasts: cmd.broadcasts,
+      rejectsWait: cmd.rejectsWait,
       fields: introspectFields(cmd.fields),
       inputFlags: inputFlagsFor(cmd),
       exclusive: cmd.exclusive,
@@ -235,6 +273,7 @@ export class HelpService {
       positionals: cmd.positionals,
       secretsTtyOnly: cmd.secretsTtyOnly,
       interactive: cmd.interactive,
+      requiresAfterAuth: cmd.requiresAfterAuth,
     });
   }
 
@@ -248,8 +287,11 @@ export class HelpService {
       auth: spec.auth,
       wallet: spec.wallet,
       broadcasts: spec.broadcasts,
+      rejectsWait: spec.rejectsWait,
       fields: introspectFields(mergedFields(def)),
+      fieldFamilies: fieldFamilies(def),
       inputFlags: spec.stdin ? inputFlagsFor(spec) : [],
+      stdinFamily: spec.stdinFamily,
       exclusive: spec.exclusive,
       examples: spec.examples,
       requires: spec.requires,
@@ -258,7 +300,6 @@ export class HelpService {
     });
   }
 
-  /** shared leaf skeleton: Usage → description → Requires → Options (incl. stdin channel) → Global options → Examples. */
   #renderLeaf(c: {
     path: string[];
     summary?: string;
@@ -267,11 +308,15 @@ export class HelpService {
     auth: CommandDefinition["auth"];
     wallet: CommandDefinition["wallet"];
     broadcasts?: boolean;
+    rejectsWait?: string;
     fields: FieldInfo[];
+    fieldFamilies?: Map<string, ChainFamily>;
     inputFlags: readonly GlobalFlag[];
+    stdinFamily?: ChainFamily;
     exclusive?: ChainSpec["exclusive"];
     examples: CommandDefinition["examples"];
     requires?: string[];
+    requiresAfterAuth?: string[];
     positionals?: { field: string; placeholder?: string }[];
     secretsTtyOnly?: boolean;
     interactive?: boolean;
@@ -286,8 +331,6 @@ export class HelpService {
       .map((p) => (p.required ? ` <${p.name}>` : ` [<${p.name}>]`))
       .join("");
     const lines = ["Usage:", `  wallet-cli ${c.path.join(" ")}${usagePositional} [options]`];
-    // leaf description: prefer the fuller multi-line `description` when a command declares one,
-    // else fall back to the one-line `summary` used in the parent group's listing.
     const description = c.description ?? c.summary;
     if (description) lines.push("", description);
 
@@ -299,17 +342,15 @@ export class HelpService {
     }
 
     const requires: string[] = [...(c.requires ?? [])];
-    // A command only prompts when it opts in (`interactive`); everything else fails fast so
-    // scripts and agents get a deterministic error instead of a hung prompt. Say which one this
-    // is — promising a TTY prompt that never comes sends the reader hunting for a broken terminal.
     if (c.auth === "required") {
       requires.push(
         c.secretsTtyOnly
           ? "the master password — entered interactively in a TTY"
           : c.interactive
-            ? "master password — pass --password-stdin for non-interactive use, or enter it interactively in a TTY"
-            : "master password — pass --password-stdin; this command never prompts",
+            ? "the master password — pass --password-stdin, or enter it interactively in a TTY"
+            : "the master password — pass --password-stdin; this command never prompts",
       );
+      requires.push(...(c.requiresAfterAuth ?? []));
     } else if (c.auth === "conditional") {
       requires.push(
         "the master password only when the selected mode signs — pass --password-stdin then; other modes need no password",
@@ -324,39 +365,39 @@ export class HelpService {
       for (const r of requires) lines.push(`  ${r}`);
     }
 
-    // positional fields are documented under Args, not repeated as --flags. A command's stdin channel
-    // (--*-stdin) is a command-specific option too, so it renders inline under Options — not a section
-    // of its own. (The machine --json-schema catalog still keeps inputFlags as a distinct key.)
     const posNames = new Set((c.positionals ?? []).map((p) => p.field));
     const flagFields = posNames.size ? c.fields.filter((f) => !posNames.has(f.name)) : c.fields;
     const optionRows: OptionRow[] = [
-      ...flagFields.map((f) => ({
-        key: f.kebab,
-        head: flagHead(f),
-        desc: f.description ?? "",
-        tag: flagTag(f),
-      })),
+      ...flagFields.map((f) => {
+        const family = c.fieldFamilies?.get(f.name);
+        return {
+          key: f.kebab,
+          head: flagHead(f),
+          desc: f.description ?? "",
+          tag: flagTag(f),
+          ...(family ? { familyTag: `(${family.toUpperCase()} only)` } : {}),
+        };
+      }),
       ...c.inputFlags.map((g) => ({
         key: g.flag.replace(/^--/, ""),
         head: globalFlagHead(g),
         desc: g.description,
         tag: globalFlagTag(g),
+        ...(c.stdinFamily ? { familyTag: `(${c.stdinFamily.toUpperCase()} only)` } : {}),
       })),
     ];
     if (optionRows.length) {
       const width = Math.min(34, Math.max(...optionRows.map((r) => r.head.length)));
-      const rowLine = (r: OptionRow, tag: string): string =>
-        `  ${r.head.padEnd(width)}  ${r.desc}${r.desc && tag ? "  " : ""}${tag}`.trimEnd();
-      // an exclusive set renders as its own labelled block, ahead of the free-standing options.
-      // A jointly-required set drops the per-member "[optional]" tag: individually true, but read
-      // together it says the whole set may be omitted — which is exactly what the runtime rejects.
-      // An "at-most-one" set genuinely may be omitted, so its members keep their tags.
+      // Family tags survive exclusive groups even when optional tags are omitted.
+      const rowLine = (r: OptionRow, tag: string): string => {
+        const tags = [tag, r.familyTag].filter(Boolean).join("  ");
+        return `  ${r.head.padEnd(width)}  ${r.desc}${r.desc && tags ? "  " : ""}${tags}`.trimEnd();
+      };
+      // Exactly-one groups omit per-member optional tags to avoid implying all may be omitted.
       const grouped = new Set<string>();
       const blocks: string[][] = [];
       for (const group of c.exclusive ?? []) {
-        // Resolving by kebab flag name means a stale or mistyped member would just disappear,
-        // leaving help that silently omits the constraint. Fail loudly — only a spec can be wrong
-        // here, never user input.
+        // A missing member is a spec error; do not silently hide the constraint.
         const members = group.flags.map((flag) => {
           const row = optionRows.find((r) => r.key === flag);
           if (!row)
@@ -379,13 +420,11 @@ export class HelpService {
     }
 
     lines.push("", "Global options:");
-    // curated per command: --network only when the command selects a network; --password-stdin
-    // only when it requires unlock; --account only when the command acts as an account.
     for (const g of globalFlagsForText(
       c.network,
       c.auth,
       c.wallet,
-      c.broadcasts ?? false,
+      acceptsWaitFlags(c),
       c.secretsTtyOnly ?? false,
     ))
       lines.push(globalFlagLine(g));
@@ -397,7 +436,6 @@ export class HelpService {
     return lines.join("\n");
   }
 
-  /** chain groups = first path segment of every assembled chain command. */
   #chainGroups(): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
@@ -415,18 +453,24 @@ export class HelpService {
     return this.#chainGroups().includes(group);
   }
 
-  /** chain group sub-commands, one row per logical chain definition. */
-  #chainGroupCommands(group: string): Array<{ path: string[]; summary?: string }> {
-    const out: Array<{ path: string[]; summary?: string }> = [];
+  #chainGroupCommands(
+    group: string,
+  ): Array<{ path: string[]; summary?: string; families: string[] }> {
+    const out: Array<{ path: string[]; summary?: string; families: string[] }> = [];
     for (const c of this.registry.all()) {
       if (isChainCommand(c) && c.spec.path[0] === group) {
-        out.push({ path: c.spec.path, summary: c.spec.summary });
+        out.push({
+          path: c.spec.path,
+          summary: c.spec.summary,
+          families: Object.entries(c.families)
+            .filter(([, binding]) => binding !== undefined)
+            .map(([family]) => family),
+        });
       }
     }
     return out;
   }
 
-  /** neutral groups = heads of neutral commands that have sub-verbs (e.g. import). */
   #neutralGroupCommands(head: string): CommandDefinition[] {
     return this.registry
       .all()
@@ -440,17 +484,28 @@ export class HelpService {
     return this.#neutralGroupCommands(head).length > 0;
   }
 
-  /** machine-readable catalog of the whole command surface — the agent's single discovery call. */
   #catalog(familyFilter?: ChainFamily): string {
-    return buildCatalog(this.registry, this.version, familyFilter);
+    return buildCatalog(this.registry, this.version, familyFilter, this.capabilities);
   }
 }
 
-function mergedFields(def: ChainCommandDefinition): ZodObject<ZodRawShape> {
-  let shape = { ...def.spec.baseFields.shape };
-  for (const b of Object.values(def.families))
-    if (b?.fields) shape = { ...shape, ...b.fields.shape };
-  return z.object(shape);
+// Help lists all families regardless of --network; shared fields must stay untagged.
+function fieldFamilies(def: ChainCommandDefinition): Map<string, ChainFamily> {
+  const owners = new Map<string, ChainFamily[]>();
+  for (const [family, binding] of Object.entries(def.families) as [
+    ChainFamily,
+    ChainCommandDefinition["families"][ChainFamily],
+  ][]) {
+    for (const name of Object.keys(binding?.fields?.shape ?? {})) {
+      owners.set(name, [...(owners.get(name) ?? []), family]);
+    }
+  }
+  const shared = new Set(Object.keys(def.spec.baseFields.shape));
+  return new Map(
+    [...owners]
+      .filter(([name, families]) => families.length === 1 && !shared.has(name))
+      .map(([name, families]) => [name, families[0]!]),
+  );
 }
 
 function metaPositionals(tokens: string[]): string[] {
@@ -471,13 +526,13 @@ function metaPositionals(tokens: string[]): string[] {
   return positionals;
 }
 
-/** "--flag <type>" header for a command flag — enum fields list their choices instead of <enum>. */
-/** one rendered Options row; `key` is the kebab flag name an ExclusiveGroup refers to. */
+// key is the kebab-case flag name used by exclusive groups.
 interface OptionRow {
   key: string;
   head: string;
   desc: string;
   tag: string;
+  familyTag?: string;
 }
 
 function flagHead(f: FieldInfo): string {
@@ -489,7 +544,6 @@ function flagHead(f: FieldInfo): string {
   return `--${f.kebab}${typ}`;
 }
 
-/** "[required]" / "[optional, default: X]" / "[optional]" tag derived from the zod schema. */
 function flagTag(f: FieldInfo): string {
   if (!f.optional && !f.hasDefault) return "[required]";
   if (f.hasDefault) return `[optional, default: ${formatDefault(f.defaultValue)}]`;
@@ -501,38 +555,34 @@ function formatDefault(v: unknown): string {
   return String(v);
 }
 
-// Per-command "Global options" projection: output/timeout/verbose always; --network only when the
-// command selects a network; --password-stdin when it may unlock; --wait/--wait-timeout
-// only for ✍️ broadcast commands; --account only when the command acts as an account (also surfaced,
-// with fuller semantics, under Requires). The full GLOBAL_FLAGS array still backs the --json-schema catalog.
 function globalFlagsForText(
   network: ChainSpec["network"] | "none",
   auth: CommandDefinition["auth"],
   wallet: CommandDefinition["wallet"],
-  broadcasts: boolean,
+  acceptsWait: boolean,
   secretsTtyOnly: boolean,
 ): GlobalFlag[] {
   return GLOBAL_FLAGS.filter((g) => {
     if (g.flag === "--account") return wallet !== "none";
     if (g.flag === "--network") return network !== "none";
     if (g.flag === "--password-stdin") return auth !== "none" && !secretsTtyOnly;
-    if (g.flag === "--wait" || g.flag === "--wait-timeout") return broadcasts;
+    if (g.flag === "--wait" || g.flag === "--no-wait") return acceptsWait;
     return true;
   });
 }
 
-/** one rendered "  --flag <type>   description  [tag]" line, used by the Global options section. */
+function groupRowTag(families: readonly string[]): string {
+  return families.length === 1 ? families[0]! : "";
+}
+
 function globalFlagLine(g: GlobalFlag): string {
   const tag = globalFlagTag(g);
   return `  ${globalFlagHead(g).padEnd(26)} ${g.description}${g.description && tag ? "  " : ""}${tag}`.trimEnd();
 }
 
-// Group descriptions, keyed by the registry group head. Usually one line; a group whose
-// behavior warrants it may span multiple lines (embed "\n"). Only groups that surface a
-// `<group> --help` page need an entry; absent → the description line is omitted.
 const GROUP_DESCRIPTIONS: Record<string, string> = {
-  import: "Import a wallet from an existing secret or device.",
-  account: "Query on-chain account state, activate accounts, and set on-chain identity fields.",
+  import: "Import a wallet.",
+  account: "Query on-chain account state.",
   token: "Manage the token address book and query tokens.",
   tx: "Build, send, broadcast, and inspect transactions.",
   contract: "Call, deploy, govern, and inspect smart contracts.",
@@ -540,24 +590,29 @@ const GROUP_DESCRIPTIONS: Record<string, string> = {
   witness: "Register and operate a super representative candidacy.",
   gasfree:
     "Gas-free token transfers via the GasFree service (open.gasfree.io).\nFees are charged in the transferred token — a per-transfer service fee, plus a one-time\nactivation fee on the first transfer from an inactive GasFree address — so no TRX is needed.\nRequires API credentials (config gasfreeApiKey / gasfreeApiSecret).",
+  sunswap:
+    "Add, remove and collect fees on SunSwap liquidity, and look up pools, positions and prices.",
+  sunpump: "Buy and sell SunPump tokens on their bonding curve, before they launch onto SunSwap.",
   stake: "Stake / delegate resources & query state (TRON Stake 2.0).",
   vote: "Vote for super representatives (SR).\nVoting accrues rewards — query and claim them with 'wallet-cli reward'.",
   reward: "Query and withdraw voting/block rewards.",
-  // The fee is a chain parameter read live at run time (getUpdateAccountPermissionFee), so it is
-  // pinned to mainnet rather than stated as an absolute.
+  // The fee varies by network and chain parameters.
   permission:
     "View and update account permissions (TRON multi-sign).\nAn account has one owner permission (full control), up to 8 active permissions (scoped operations),\nand — for SRs — one witness permission. Replacing the structure burns a chain-set fee (100 TRX on mainnet).\nMisconfiguring owner permission can permanently lock the account.",
-  chain: "Query on-chain parameters, resource prices, and node status.",
+  chain: "Query chain and node state.",
   message: "Sign arbitrary messages.",
   "typed-data": "Sign EIP-712 / TIP-712 structured data.",
+  asset: "Issue and manage TRC10 tokens.",
+  exchange: "Create and trade Bancor exchange pairs.",
   block: "Get a block (latest if omitted).",
   encoding: "Convert and validate addresses and encodings across formats.",
   address: "Generate a random secp256k1 keypair locally without storing it in the wallet.",
-  contact:
-    "Manage the local recipient address book.\nNames can be used directly in 'tx send --to' and 'gasfree transfer --to'.",
+  contact: "Manage the recipient address book.",
+  bai: "Query B.AI account credits, usage records, and recharge orders.",
+  "8004": "Read and manage ERC-8004 Agent identities on supported networks.",
+  x402: "Pay x402 endpoints and inspect the provider catalog.",
 };
 
-/** "--output, -o <text|json>" style header for text help. */
 function globalFlagHead(g: GlobalFlag): string {
   const head = g.alias ? `${g.flag}, ${g.alias}` : g.flag;
   const typ = g.type === "boolean" ? "" : ` <${g.values ? g.values.join("|") : g.type}>`;
@@ -569,7 +624,6 @@ function globalFlagTag(g: GlobalFlag): string {
   return "[optional]";
 }
 
-/** color only when stdout is a TTY and NO_COLOR is unset — piped/redirected help stays plain. */
 function colorOn(): boolean {
   return !!process.stdout.isTTY && !process.env.NO_COLOR;
 }

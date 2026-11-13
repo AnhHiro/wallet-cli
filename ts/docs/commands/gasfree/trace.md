@@ -23,25 +23,27 @@ No command-specific options; `traceId` is a positional argument, plus the [globa
 ## Examples
 
 ```bash
-wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network tron:nile
+wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network nile
 ```
 
 ```console
-Trace ID  7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527
-Status    succeed
-TxID      d2e...
-Token     USDT
-Amount    25 USDT
-Fee       0.5 USDT
-To        TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub
+Trace ID        7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527
+Status          succeed
+TxID            d2e...
+Token           USDT
+Amount          25 USDT
+Service fee     0.5 USDT
+Activation fee  0 USDT
+Total           25.5 USDT
+To              TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c
 ```
 
 ```bash
-wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network tron:nile -o json
+wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network nile -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"gasfree.trace","data":{"traceId":"7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527","state":"SUCCEED","txId":"d2e...","token":"USDT","amount":"25000000","serviceFee":"500000","activateFee":"0","to":"TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub"},"meta":{"durationMs":290,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"gasfree.trace","data":{"traceId":"7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527","state":"SUCCEED","txId":"d2e...","token":"USDT","tokenAddress":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf","decimals":6,"amount":"25000000","serviceFee":"500000","activateFee":"0","totalDeducted":"25500000","from":"TNER12mMVWruqopsW9FQtKxCGfZcEtb3ER","owner":"TMVQGm1qAQYVdetCeGRRkTWYYrLXuHK2HC","to":"TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c","nonce":"8"},"meta":{"durationMs":290,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 ## Output
@@ -50,6 +52,12 @@ wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network tron:nil
 |---|---|---|
 | `traceId` | string | The provider's acceptance id |
 | `state` | string | Raw state enum: `WAITING` / `INPROGRESS` / `CONFIRMING` / `SUCCEED` / `FAILED` |
+| `tokenAddress` | string | TRC20 contract address |
+| `decimals` | number | Token decimals used to render amounts |
+| `totalDeducted` | string | Amount plus the settled service and activation fees, in token base units |
+| `from` / `owner` | string | GasFree holding address / owning account address |
+| `nonce` | string | Authorization nonce |
+| `failureReason` | string | Provider explanation, only when supplied for a failed transfer |
 | `txId` | string | On-chain transaction id (once submitted) |
 | `token` | string | Token symbol |
 | `amount` | string | Amount, in token base units |
@@ -58,7 +66,7 @@ wallet-cli gasfree trace 7f3e9a02-58c1-4d2e-b6a4-91d0c3f8e527 --network tron:nil
 
 ## Exit status
 
-`0` success · `1` execution failure (`gasfree_credentials_missing`, `not_found` — no such trace id, `gasfree_integrity`, `provider_error`, `unsupported_network`) · `2` usage error (`invalid_value`).
+`0` success · `1` execution failure (`not_found` — no such trace id (HTTP 404, or the service returned no data), `gasfree_integrity`, `gasfree_rejected` — the service declined the request or returned a 4xx status other than 401, 403, 404 and 429, `timeout` — the service did not answer within `--timeout`, `gasfree_auth_failed` — the service rejected the API credentials (HTTP 401 or 403), `provider_error` — the service could not be reached, returned a 5xx status, answered with malformed or oversized JSON, or returned a field this CLI will not act on; `provider_rate_limited` — the service returned 429, with `details.httpStatus: 429` and `details.retryAfterSeconds` when it sent a usable `Retry-After`) · `2` usage error (`gasfree_credentials_missing`, `unsupported_network`, `unsupported_network_capability` — Shasta, `invalid_value`, `invalid_config` — the network's GasFree `baseUrl` or `apiPrefix` is invalid).
 
 A `FAILED` transfer is a successful query: the envelope stays `success: true` at exit `0`, and `data.failureReason` carries the provider's explanation.
 

@@ -1,3 +1,4 @@
+import { structuredText } from "./structured.js";
 import type { TextFormatter, TextRenderContext } from "../contracts/index.js";
 import { asObj, ok, pending, receipt, titled } from "./layout.js";
 import { formatInt, formatSun } from "./scalars.js";
@@ -83,9 +84,7 @@ function renderGovernanceReceipt(data: Obj, ctx: TextRenderContext): string {
     fields.push(["Fee", estimateFee(data)]);
     return appendChanges(receipt(pending(), `Dry run ${label}`, fields), data);
   }
-  // Both early-exit modes exist to produce a relayable artifact, so the hex IS the output —
-  // bare, as `tx send` prints it, so it pipes into a file or the next command unchanged. The
-  // receipts below remain for the case the pipeline could not serialise one.
+  // Emit bare artifact hex so build-only and sign-only output can be piped.
   if (mode === "build-only") {
     if (data.hex) return String(data.hex);
     return appendChanges(receipt(ok(), `Built unsigned ${label}`, fields), data);
@@ -235,7 +234,7 @@ function confirmedFee(data: Obj): string {
 function signedSummary(value: unknown): string {
   if (!value || typeof value !== "object") return String(value ?? "");
   const signatures = (value as { signature?: unknown }).signature;
-  return Array.isArray(signatures) ? signatures.map(String).join(", ") : JSON.stringify(value);
+  return Array.isArray(signatures) ? signatures.map(String).join(", ") : structuredText(value);
 }
 
 function changeValue(value: unknown): string {
@@ -248,7 +247,6 @@ function width(values: string[]): number {
   return Math.max(0, ...values.map((value) => value.length));
 }
 
-/** Column-aligned rows; numeric columns are right-aligned so digits line up down the page. */
 function table(headers: string[], rows: string[][], align: Align[]): string[] {
   const widths = headers.map((header, index) =>
     Math.max(header.length, ...rows.map((row) => String(row[index] ?? "").length)),

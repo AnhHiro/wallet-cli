@@ -1,13 +1,33 @@
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join, relative } from "node:path";
 import { z } from "zod";
 import { permissionUpdateSpec } from "./permission.js";
-import { governanceTxModeFields, txModeFields } from "./shared.js";
+import { accountActivateSpec, accountSetSpec } from "./account.js";
+import {
+  assetIssueSpec,
+  assetParticipateSpec,
+  assetUnfreezeSpec,
+  assetUpdateSpec,
+} from "./asset.js";
+import {
+  exchangeCreateSpec,
+  exchangeInjectSpec,
+  exchangeTradeSpec,
+  exchangeWithdrawSpec,
+} from "./exchange.js";
+import { rewardWithdrawSpec } from "./reward.js";
+import { stakeDefinitions } from "./stake.js";
+import { voteCastSpec } from "./vote.js";
+import type { ChainSpec } from "../contracts/index.js";
+import { governanceTxModeFields, tronTxModeFields, txModeFields } from "./shared.js";
+
+const txModeAndTron = { ...txModeFields, ...tronTxModeFields };
 
 describe("transaction option argv coercion", () => {
   it("accepts numeric --permission-id and --expiration values from argv", () => {
-    const parsed = z.object(txModeFields).parse({
+    const parsed = z.object(txModeAndTron).parse({
       buildOnly: true,
       permissionId: "2",
       expiration: "86400000",
@@ -30,12 +50,9 @@ describe("transaction option argv coercion", () => {
   });
 });
 
-// These two flags exist only for multi-sign, and their help used to state neither what the values
-// mean nor what the limits are. A co-signer reading `--help` could not tell which permission group
-// to pass, nor that the collection window they were extending is capped at 24h.
 describe("shared --permission-id / --expiration document their semantics", () => {
-  const describeOf = (name: keyof typeof txModeFields): string =>
-    (txModeFields[name] as { description?: string }).description ?? "";
+  const describeOf = (name: keyof typeof txModeAndTron): string =>
+    (txModeAndTron[name] as { description?: string }).description ?? "";
 
   it("spells out what a permission group id means", () => {
     const text = describeOf("permissionId");
@@ -45,10 +62,9 @@ describe("shared --permission-id / --expiration document their semantics", () =>
   });
 
   it("states the expiration cap, and quotes the number the schema actually enforces", () => {
-    const schema = z.object(txModeFields);
+    const schema = z.object(txModeAndTron);
     expect(schema.safeParse({ buildOnly: true, expiration: 86_400_000 }).success).toBe(true);
     expect(schema.safeParse({ buildOnly: true, expiration: 86_400_001 }).success).toBe(false);
-    // the description must quote that same bound — a stale number here is worse than none
     expect(describeOf("expiration")).toContain("86400000");
     expect(describeOf("expiration")).toContain("24h");
   });
@@ -57,17 +73,12 @@ describe("shared --permission-id / --expiration document their semantics", () =>
     expect(describeOf("expiration")).toMatch(/node default.*60s/);
   });
 
-  // --build-only produces an artifact nobody can use without knowing what consumes it. Both
-  // multi-sig routes start here — the hex relay through `tx sign` and the TronLink queue through
-  // `tx multisig` (docs/commands/tx/index.md) — so naming only one of them would be worse than
-  // naming neither: it reads as "this flag is for the service path".
   it("says what the unsigned hex is for, and does not narrow it to one route", () => {
     const text = describeOf("buildOnly");
     expect(text).toMatch(/tx sign/);
     expect(text).toMatch(/tx multisig/);
   });
 
-  // permission update carries its own copies of these fields; two copies of a description drift.
   it("permission update shows the same text, not a stale copy", () => {
     const shape = permissionUpdateSpec.baseFields.shape as Record<string, { description?: string }>;
     expect(shape.permissionId?.description).toBe(describeOf("permissionId"));
@@ -76,12 +87,8 @@ describe("shared --permission-id / --expiration document their semantics", () =>
   });
 });
 
-// `txModeFields` is shared, so adding a flag to it silently widens 14 commands at once while their
-// individual reference pages stay behind — which is exactly how --build-only / --permission-id /
-// --expiration ended up documented on only 3 of the 14. A page that documents the transaction modes
-// at all must document all of them.
 describe("reference pages keep up with the shared transaction options", () => {
-  const DOCS = new URL("../../../../../docs/commands/", import.meta.url).pathname;
+  const DOCS = fileURLToPath(new URL("../../../../../docs/commands/", import.meta.url));
   const REQUIRED = ["--build-only", "--permission-id", "--expiration"];
 
   function pages(directory: string): string[] {
@@ -94,13 +101,9 @@ describe("reference pages keep up with the shared transaction options", () => {
     );
   }
 
-  // Presence is not enough. These two rows carried the pre-A-2/A-3 wording — a permission id with
-  // no key to its values, and a range with no readable bound — so a reader who went to the
-  // reference page instead of `--help` still could not tell which group to pass.
   it("every --permission-id row carries the same value key the flag's help does", () => {
-    // taken from the schema, not restated here: one wording, two surfaces
     const key = /\((0=owner[^)]*)\)/.exec(
-      (txModeFields.permissionId as { description?: string }).description ?? "",
+      (tronTxModeFields.permissionId as { description?: string }).description ?? "",
     )?.[1];
     expect(key).toBeTruthy();
 
@@ -136,8 +139,7 @@ describe("reference pages keep up with the shared transaction options", () => {
   it("every page offering --sign-only also documents the rest of the shared modes", () => {
     const behind = pages(DOCS)
       .map((path) => ({ path, text: readFileSync(path, "utf8") }))
-      // An Options-table ROW for --sign-only means the command itself carries the shared object;
-      // prose mentions (tx/index, tx/sign) merely refer to other commands and must not be flagged.
+      // Match option rows; prose may refer to flags on other commands.
       .filter(({ text }) => /^\| `--sign-only`/m.test(text))
       .filter(({ text }) => REQUIRED.some((flag) => !text.includes(flag)))
       .map(({ path }) => relative(DOCS, path));
@@ -146,25 +148,64 @@ describe("reference pages keep up with the shared transaction options", () => {
   });
 });
 
-/**
- * The governance group re-declared `--permission-id` with an int32 ceiling, so `--help` advertised a
- * range the application layer then refused: `transactionMode()` accepts 0..9 and rejects anything
- * above it with `invalid_option`, after the command has already started. TRON has at most eight
- * active permissions (ids 2..9) plus owner (0), so 0..9 is the real bound and the override was
- * simply wrong — it also downgraded the failure from a schema `invalid_value` to a runtime
- * `invalid_option`, classifying the same mistake differently from every non-governance command.
- */
 describe("governance --permission-id shares the protocol bound with every other command", () => {
   const field = (fields: Record<string, unknown>) => z.object(fields as never);
 
-  it("rejects a permission id above the protocol maximum at the schema, as txModeFields does", () => {
+  it("rejects a permission id above the protocol maximum, as the TRON field set does", () => {
     expect(field(governanceTxModeFields).safeParse({ permissionId: "10" }).success).toBe(false);
-    expect(field(txModeFields).safeParse({ permissionId: "10" }).success).toBe(false);
+    expect(field(tronTxModeFields).safeParse({ permissionId: "10" }).success).toBe(false);
+    expect(Object.keys(txModeFields)).not.toContain("permissionId");
   });
 
   it("still accepts the whole valid range", () => {
     for (const id of ["0", "2", "9"]) {
       expect(field(governanceTxModeFields).safeParse({ permissionId: id }).success).toBe(true);
     }
+  });
+});
+
+describe("TRON-only writes still carry the multi-signature transaction options", () => {
+  const specs: Array<[string, ChainSpec]> = [
+    ["account activate", accountActivateSpec],
+    ["account set", accountSetSpec],
+    ["asset issue", assetIssueSpec],
+    ["asset participate", assetParticipateSpec],
+    ["asset unfreeze", assetUnfreezeSpec],
+    ["asset update", assetUpdateSpec],
+    ["exchange create", exchangeCreateSpec],
+    ["exchange inject", exchangeInjectSpec],
+    ["exchange trade", exchangeTradeSpec],
+    ["exchange withdraw", exchangeWithdrawSpec],
+    ["reward withdraw", rewardWithdrawSpec],
+    ["vote cast", voteCastSpec],
+    ...stakeDefinitions({} as never)
+      .filter(({ spec }) => spec.broadcasts)
+      .map(({ spec }) => [spec.path.join(" "), spec] as [string, ChainSpec]),
+  ];
+
+  it.each(specs)("%s declares both flags", (_name, spec) => {
+    const shape = spec.baseFields.shape as Record<string, unknown>;
+    expect(Object.keys(shape)).toEqual(expect.arrayContaining(["permissionId", "expiration"]));
+  });
+
+  it.each(specs)("%s reuses the shared field definitions verbatim", (_name, spec) => {
+    const shape = spec.baseFields.shape as Record<string, unknown>;
+    expect(shape.permissionId).toBe(tronTxModeFields.permissionId);
+    expect(shape.expiration).toBe(tronTxModeFields.expiration);
+  });
+
+  it.each(specs)("%s keeps the shared --build-only description", (_name, spec) => {
+    const shape = spec.baseFields.shape as Record<string, { description?: string }>;
+    expect(shape.buildOnly?.description).toBe(
+      (txModeFields.buildOnly as { description?: string }).description,
+    );
+  });
+
+  it.each(specs)("%s coerces both flags from argv strings", (_name, spec) => {
+    const parsed = spec.baseFields
+      .pick({ permissionId: true, expiration: true })
+      .parse({ permissionId: "2", expiration: "86400000" });
+    expect(parsed.permissionId).toBe(2);
+    expect(parsed.expiration).toBe(86_400_000);
   });
 });

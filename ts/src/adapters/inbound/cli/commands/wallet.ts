@@ -1,29 +1,19 @@
-/**
- * Wallet root commands — create/import/list/current/use/backup. Not chain-bound; no --network.
- * Calls WalletService rather than the transaction pipeline.
- */
 import { existsSync } from "node:fs";
 import { z } from "zod";
-import type { CommandDefinition } from "../contracts/index.js";
+import type { CommandDefinition, ExclusiveGroup } from "../contracts/index.js";
 import { Schemas } from "../schemas/index.js";
 import { CommandRegistry } from "../registry/index.js";
 import { accountRef, camelToKebab, ciEnum } from "../arity/index.js";
-import type { LedgerDevice } from "../../../../application/ports/ledger-device.js";
-import type { QrEncoder } from "../../../../application/ports/qr-encoder.js";
+import type { QrDisplay, QrEncoder } from "../../../../application/ports/qr-encoder.js";
+import type { BackupOperation } from "../../../../application/ports/backup-records.js";
 import type { WalletService } from "../../../../application/use-cases/wallet-service.js";
-import {
-  resolveLedgerPath,
-  selectLedgerPath,
-} from "../../../../application/services/ledger-account.js";
+import { DEFAULT_SCAN_LIMIT } from "../../../../application/services/ledger-account.js";
 import { ChainFamily, CHAIN_FAMILIES, FAMILIES } from "../../../../domain/family/index.js";
-import { UsageError } from "../../../../domain/errors/index.js";
-import { passwordPolicyErrors } from "../input/prompt/validators.js";
+import { errorMessage, UsageError } from "../../../../domain/errors/index.js";
+import { passwordPolicyErrors } from "../../../../domain/wallet/password-policy.js";
 import { readBoundedTextFile } from "./artifact.js";
 import { TextFormatters } from "../render/index.js";
 
-// ── wallet import-ledger contract (module scope so it can be unit-tested) ───────
-// The selectable Ledger apps are the families with a wired Ledger app (FAMILIES[f].ledger);
-// the enum drives both --help and the interactive prompt.
 const LEDGER_APP_BY_FAMILY: Partial<Record<ChainFamily, string>> = Object.fromEntries(
   CHAIN_FAMILIES.flatMap((f) => (FAMILIES[f].ledger ? [[f, FAMILIES[f].ledger!.app]] : [])),
 );
@@ -35,77 +25,53 @@ const LEDGER_APPS = CHAIN_FAMILIES.map((f) => LEDGER_APP_BY_FAMILY[f]).filter(
 ) as [string, ...string[]];
 export const walletImportLedgerFields = z.object({
   app: ciEnum(LEDGER_APPS).describe(
-    "Ledger app to open on the device, selecting the address-derivation scheme",
+    // Device app selection is independent of --network.
+    "Ledger app to open on the device; selects the chain family",
   ),
   index: z.coerce
     .number()
     .int()
     .nonnegative()
     .optional()
+    // A schema default would count as a second locator when --path or --address is supplied.
     .describe(
-      "HD account index to import; omit with no --path/--address to use index 0; mutually exclusive with --path and --address",
+      "Ledger Live account index (m/44'/<coin>'/<index>'/0/0); defaults to 0 when no locator is given",
     ),
-  path: z
-    .string()
-    .optional()
-    .describe(
-      "explicit BIP32 derivation path, e.g. m/44'/195'/0'/0/0 for TRON; mutually exclusive with --index and --address",
-    ),
-  address: z
-    .string()
-    .optional()
-    .describe(
-      "known address to locate by bounded scan; mutually exclusive with --index and --path",
-    ),
+  path: z.string().optional().describe("explicit derivation path"),
+  address: z.string().optional().describe("known address to locate by bounded scan"),
   scanLimit: z.coerce
     .number()
     .int()
     .positive()
-    .optional()
-    .describe(
-      "number of account indexes to scan when using --address, in indexes; omit to scan 20 indexes",
-    ),
+    .default(DEFAULT_SCAN_LIMIT)
+    .describe("how many indexes to scan when using --address"),
   label: Schemas.label()
     .optional()
     .describe("human-friendly unique account label, 1-64 chars; omit to auto-generate"),
 });
-/** --index / --path / --address are mutually exclusive (at most one locator). */
-export const walletImportLedgerInput = walletImportLedgerFields.superRefine((v, c) => {
-  const locators = [v.index !== undefined, v.path !== undefined, v.address !== undefined].filter(
-    Boolean,
-  ).length;
-  if (locators > 1)
-    c.addIssue({
-      code: "custom",
-      path: ["index"],
-      message: "--index, --path and --address are mutually exclusive",
-    });
-});
-
-// ── import keystore file reading ───────────────────────────────────────────────
-// A V3 keystore is a small JSON document; the cap only exists to refuse a file that plainly is not
-// one before it is read into memory.
+export const walletImportLedgerExclusive: ExclusiveGroup[] = [
+  {
+    label: "where the account is on the device; omit all three for index 0",
+    flags: ["index", "path", "address"],
+    select: "at-most-one",
+  },
+];
 const KEYSTORE_MAX_BYTES = 64 * 1024;
 
-/** the parsed JSON of a keystore file. Distinguishes "no such file" from "not a keystore" so the
- *  caller learns which of the two mistakes they made. */
 function readKeystoreFile(path: string): unknown {
-  if (!existsSync(path)) throw new UsageError("keystore_not_found", `no keystore file at ${path}`);
+  if (!existsSync(path))
+    throw new UsageError("keystore_not_found", errorMessage`no keystore file at ${path}`);
   const raw = readBoundedTextFile(path, KEYSTORE_MAX_BYTES, "keystore file");
   try {
     return JSON.parse(raw) as unknown;
   } catch {
-    throw new UsageError("invalid_keystore", `${path} is not valid JSON`);
+    throw new UsageError("invalid_keystore", errorMessage`${path} is not valid JSON`);
   }
 }
 
-// ── backup --records time bounds ───────────────────────────────────────────────
-// `YYYY-MM-DD` or `YYYY-MM-DD HH:mm:ss`, always read as UTC — the log is written in UTC, and a
-// local-time reading would silently shift a boundary by the machine's offset. A bare date means that
-// day's 00:00:00 (both bounds are inclusive instants, not day ranges).
+// UTC bounds are inclusive instants; a bare date means midnight, not the whole day.
 const UTC_DATETIME = /^(\d{4})-(\d{2})-(\d{2})(?: (\d{2}):(\d{2}):(\d{2}))?$/;
 
-/** the ISO-8601 instant a bound denotes, or undefined when the bound was not given. */
 function utcInstant(value: string | undefined): string | undefined {
   if (value === undefined) return undefined;
   const [, y, mo, d, h = "00", mi = "00", s = "00"] = UTC_DATETIME.exec(value)!;
@@ -118,8 +84,7 @@ function utcDateTime(describe: string) {
     .refine((v) => {
       const m = UTC_DATETIME.exec(v);
       if (!m) return false;
-      // Reject impossible calendar values (2026-02-31, 25:00:00): Date normalises them silently, so
-      // compare the round-trip instead of trusting the parse.
+      // Date normalizes invalid calendar values; require an exact round trip.
       const iso = utcInstant(v)!;
       const parsed = new Date(iso);
       return (
@@ -130,18 +95,27 @@ function utcDateTime(describe: string) {
     .describe(`${describe}; format YYYY-MM-DD or 'YYYY-MM-DD HH:mm:ss', parsed as UTC`);
 }
 
+// A pipe or file has no columns.
+function stdoutDisplay(): QrDisplay {
+  return { isTTY: process.stdout.isTTY === true, columns: process.stdout.columns ?? 0 };
+}
+
+// Records name each export by the command that made it.
+const BACKUP_OPERATION_SPELLING: Record<BackupOperation, string> = {
+  "native-export": "backup",
+  "keystore-export": "backup --keystore",
+};
+
 export function registerWalletCommands(
   reg: CommandRegistry,
   services: {
     walletService: WalletService;
-    ledger: LedgerDevice;
     qr?: QrEncoder;
   },
 ): void {
   const wallets = services.walletService;
   const empty = z.object({});
 
-  // ── create ───────────────────────────────────────────────────────────────
   const createFields = z.object({
     label: Schemas.label()
       .optional()
@@ -156,6 +130,9 @@ export function registerWalletCommands(
     interactive: true,
     promptHints: { label: "default-label" },
     summary: "Create a new HD wallet (BIP39 seed)",
+    description:
+      "Create a new HD wallet (BIP39 seed). Derives one address per chain family\n" +
+      "from the same seed; the recovery phrase is encrypted locally and never printed.",
     fields: createFields,
     input: createFields,
     examples: [{ cmd: "wallet-cli create --label main" }],
@@ -168,8 +145,6 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── import mnemonic ───────────────────────────────────────────────────────
-  // BIP39 passphrase intentionally NOT exposed in phase 1 ; plumbing stays.
   const importMnemonicFields = z.object({
     label: Schemas.label()
       .optional()
@@ -188,7 +163,8 @@ export function registerWalletCommands(
     promptHints: { label: "default-label" },
     summary: "Import a BIP39 mnemonic phrase",
     description:
-      "Import a BIP39 mnemonic phrase. The recovery phrase and master password are read\n" +
+      "Import a BIP39 mnemonic phrase. Derives one address per chain family from the same\n" +
+      "seed, the same as `create`. The recovery phrase and master password are read\n" +
       "interactively from the TTY (hidden input); they never touch argv or stdin.",
     fields: importMnemonicFields,
     input: importMnemonicFields,
@@ -202,7 +178,6 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── import private-key ────────────────────────────────────────────────────
   const importPrivateKeyFields = z.object({
     label: Schemas.label()
       .optional()
@@ -222,7 +197,8 @@ export function registerWalletCommands(
     summary: "Import a raw private key",
     description:
       "Import a raw private key. The private key and master password are read\n" +
-      "interactively from the TTY (hidden input); they never touch argv or stdin.",
+      "interactively from the TTY (hidden input); they never touch argv or stdin.\n" +
+      "One key yields an address on every chain family.",
     fields: importPrivateKeyFields,
     input: importPrivateKeyFields,
     examples: [{ cmd: "wallet-cli import private-key --label hot" }],
@@ -235,14 +211,7 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── import keystore ───────────────────────────────────────────────────────
-  // Two independent passwords, both hidden-TTY-only: the FILE's own password (to decrypt it) and our
-  // master password (to re-encrypt it locally). The file is read and structurally validated before
-  // EITHER password prompt, so a typo'd path costs no password typing — hence no `passwordMode`
-  // (which would prime the master password up in the shell, ahead of `run`); priming happens inside
-  // `run`, after the file (same reasoning as `backup`). Do not "restore" passwordMode here.
-  // The shell's secretsTtyOnly gate still runs first and reports tty_required without a terminal —
-  // correct, and uniform with the other TTY-only commands: there is no prompt to save there.
+  // Read and parse the file before prompting; passwordMode would prompt during dispatch.
   const importKeystoreFields = z.object({
     path: z.string().min(1).describe("path to the keystore JSON file"),
     label: Schemas.label()
@@ -259,14 +228,12 @@ export function registerWalletCommands(
     positionals: [{ field: "path" }],
     promptHints: { label: "default-label" },
     requires: ["the keystore file's own password — entered interactively in a TTY"],
-    summary: "Import an account from a standard Web3 keystore JSON",
+    summary: "Import a Web3 keystore file",
     description:
-      "Import a single account from a standard Web3 keystore JSON (as exported by TronLink or\n" +
-      "'backup --keystore'), stored encrypted under your master password and made active. It carries\n" +
-      "one private key, so nothing can be derived from it; a same-address account is refused with\n" +
-      "account_exists (delete it first).\n\n" +
-      "Interactive-only: the master password and the keystore's own password are entered only via\n" +
-      "hidden TTY prompts, never stdin/argv — without a TTY it fails with tty_required.",
+      "Import a single account from a standard Web3 keystore JSON (TronLink, `backup --keystore`).\n" +
+      "It carries one private key, so nothing can be derived from it. The master password and the\n" +
+      "keystore's own password are read interactively from the TTY (hidden input); they never touch\n" +
+      "argv or stdin.",
     fields: importKeystoreFields,
     input: importKeystoreFields,
     examples: [
@@ -287,7 +254,6 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── import ledger ─────────────────────────────────────────────────────────
   reg.add({
     path: ["import", "ledger"],
     network: "none",
@@ -302,10 +268,14 @@ export function registerWalletCommands(
       scanLimit: "skip",
     },
     requires: ["a connected, unlocked Ledger with the selected app (--app) open"],
-    summary: "Register a Ledger account (watch-only; signs on device)",
+    summary: "Register a Ledger account (signs on the device)",
     fields: walletImportLedgerFields,
-    input: walletImportLedgerInput,
-    examples: [{ cmd: "wallet-cli import ledger --app tron --index 0 --label cold" }],
+    input: walletImportLedgerFields,
+    exclusive: walletImportLedgerExclusive,
+    examples: [
+      { cmd: "wallet-cli import ledger --app tron --index 0 --label cold" },
+      { cmd: "wallet-cli import ledger --app ethereum --index 0 --label cold-evm" },
+    ],
     formatText: TextFormatters.walletLedger,
     run: async (ctx, _net, input) => {
       const family: ChainFamily = FAMILY_BY_LEDGER_APP[input.app]!;
@@ -313,19 +283,25 @@ export function registerWalletCommands(
         input.index !== undefined || input.path !== undefined || input.address !== undefined;
       const path =
         hasLocator || !ctx.prompt.isTTY()
-          ? await resolveLedgerPath(services.ledger, family, input)
-          : await selectLedgerPath(services.ledger, family, ctx.prompt);
+          ? await wallets.ledgerPath(ctx.deadline, family, input)
+          : await wallets.selectLedgerPath(
+              ctx.deadline,
+              family,
+              ctx.prompt,
+              `Select ${family} account (Ledger Live template; use --path for another scheme)`,
+            );
       ctx.emit({ type: "deriving-address" });
-      return wallets.importLedger(family, path, input.label);
+      return wallets.importLedger(ctx.deadline, family, path, input.label);
     },
   } satisfies CommandDefinition);
 
-  // ── import watch ──────────────────────────────────────────────────────────
   const importWatchFields = z.object({
     address: z
       .string()
       .min(1)
-      .describe("watch-only address to track; format: TRON base58 T...; family is auto-detected"),
+      .describe(
+        "watch-only address to track; TRON base58 (T...) or EVM hex (0x...), detected from the value",
+      ),
     label: Schemas.label()
       .optional()
       .describe("human-friendly unique account label, 1-64 chars; omit to auto-generate"),
@@ -337,7 +313,10 @@ export function registerWalletCommands(
     auth: "none",
     interactive: true,
     promptHints: { label: "default-label" },
-    summary: "Register a watch-only address (no secret)",
+    summary: "Register a watch-only address",
+    description:
+      "Register a watch-only address (no secret). The chain family is detected from the\n" +
+      "address format; the account is usable only on networks of that family.",
     fields: importWatchFields,
     input: importWatchFields,
     examples: [{ cmd: "wallet-cli import watch --address T... --label team-vault" }],
@@ -347,21 +326,47 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── list ─────────────────────────────────────────────────────────────────
   reg.add({
     path: ["list"],
-    network: "none",
+    // Network selects the display family; listing requires no active account.
+    network: "optional",
     wallet: "none",
     auth: "none",
     summary: "List wallets/accounts (no unlock needed)",
+    description:
+      "List every local account, grouped by HD seed and by type; no unlock needed. The address " +
+      "column shows the family of the selected network; JSON output always carries every " +
+      "family's address.",
     fields: empty,
     input: empty,
-    examples: [{ cmd: "wallet-cli list --output json" }],
+    examples: [
+      { cmd: "wallet-cli list" },
+      { cmd: "wallet-cli list --network sepolia" },
+      { cmd: "wallet-cli list --output json" },
+    ],
     formatText: TextFormatters.walletList,
-    run: async () => wallets.list(),
+    run: async (context, network) => {
+      const unreadable = wallets.unreadableWallets();
+      if (unreadable.length > 0) {
+        context.warn(
+          `${unreadable.length} account(s) use a wallet format this version does not understand ` +
+            `and were skipped: ${unreadable.join(", ")}. Upgrade wallet-cli to use them.`,
+        );
+      }
+      const accounts = wallets.list();
+      if (context.output === "text" && network) {
+        const hidden = accounts.filter((a) => !a.addresses[network.family]).length;
+        if (hidden > 0) {
+          context.warn(
+            `${hidden} account(s) have no ${network.family} address and are not shown; ` +
+              "use --network to switch, or --output json to see every family",
+          );
+        }
+      }
+      return accounts;
+    },
   } satisfies CommandDefinition);
 
-  // ── use ──────────────────────────────────────────────────────────────────
   const setActiveFields = z.object({
     account: z
       .string()
@@ -384,39 +389,47 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── current ───────────────────────────────────────────────────────────────
   const currentFields = z.object({
     qr: z
       .boolean()
       .default(false)
       .describe(
-        "render a terminal receive QR containing exactly the selected TRON address; text TTY only",
+        "render a terminal receive QR containing exactly the receive address for the selected network; text TTY only",
       ),
   });
   reg.add({
     path: ["current"],
-    network: "none",
+    network: "optional",
     wallet: "optional",
     auth: "none",
     summary: "Show the current active account",
     description:
-      "Show the selected account locally. --qr appends a scannable TRON receive-address QR in text mode without unlocking or accessing the network.",
+      "Show the selected account locally, with one address line per chain family it has. --qr " +
+      "appends a scannable receive-address QR in text mode, for the family of the selected " +
+      "network. Neither unlocks the keystore nor contacts the node.",
     fields: currentFields,
     input: currentFields,
     examples: [
       { cmd: "wallet-cli current" },
       { cmd: "wallet-cli current --qr" },
       { cmd: "wallet-cli current --qr --account main" },
+      { cmd: "wallet-cli current --qr --network sepolia" },
     ],
     formatText: TextFormatters.walletCurrent,
-    run: async (context, _network, input) => {
+    run: async (context, network, input) => {
       const descriptor = wallets.current(context.activeAccount);
-      if (!input.qr || context.output !== "text") return descriptor;
-      const address = descriptor.addresses.tron;
+      if (!input.qr) return descriptor;
+      const address = network ? descriptor.addresses[network.family] : undefined;
       if (!address) {
-        throw new UsageError("invalid_value", "selected account has no TRON receive address");
+        // Never fall back to another family for a receive address.
+        throw new UsageError(
+          "family_mismatch",
+          `selected account has no ${network?.family} address; ${network?.id} cannot receive to it`,
+        );
       }
-      const qr = services.qr?.encode(address) ?? null;
+      // Validate the receive family for every output format before rendering.
+      if (context.output !== "text") return { ...descriptor, receiveAddress: address };
+      const qr = services.qr?.encode(address, stdoutDisplay()) ?? null;
       if (!qr) {
         context.warn(
           "terminal is non-interactive or too narrow for a complete QR code; showing the full address only",
@@ -431,7 +444,6 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── rename ────────────────────────────────────────────────────────────────
   const renameFields = z.object({
     account: z.string().min(1).describe("accountId, current label, or address to rename"),
     label: Schemas.label().describe("new unique label, 1-64 chars"),
@@ -452,25 +464,26 @@ export function registerWalletCommands(
     },
   } satisfies CommandDefinition);
 
-  // ── derive ────────────────────────────────────────────────────────────────
-  // Wallet-level op: --seed-id picks the HD wallet directly by its seed id. No --account/active.
   const addAccountFields = z.object({
     seedId: z
       .string()
       .min(1)
-      .describe(
-        "seed id (wlt_…) of the HD wallet to derive from — shown as the HD group header in `list`",
-      ),
+      .optional()
+      .describe("seed id (wlt_…) of the HD wallet to derive from; takes precedence over --account"),
+    account: accountRef(
+      "accountId, label, or address belonging to the HD wallet; defaults to the active account",
+      { optional: true },
+    ),
     index: z.coerce
       .number()
       .int()
       .nonnegative()
       .optional()
-      .describe("explicit HD account index, in account index; omit to use the next free index"),
+      .describe("address index in m/44'/<coin>'/0'/0/<index>; omit to use the next free index"),
     label: Schemas.label()
       .optional()
       .describe(
-        "label for the new derived account, 1-64 chars; omit to auto-generate <wallet-name>-<index>",
+        "label for the new derived account, 1-64 chars, unique; omit to auto-generate <wallet-name>-<index>",
       ),
   });
   reg.add({
@@ -478,17 +491,21 @@ export function registerWalletCommands(
     network: "none",
     wallet: "none",
     auth: "required",
-    summary: "Derive the next HD account from a seed wallet (by --seed-id)",
+    summary: "Derive the next HD account from a seed wallet",
+    description: "Derive one address per family using m/44'/<coin>'/0'/0/<index>.",
     fields: addAccountFields,
     input: addAccountFields,
-    examples: [{ cmd: "wallet-cli derive --seed-id wlt_ab12cd34" }],
+    examples: [
+      { cmd: "wallet-cli derive" },
+      { cmd: "wallet-cli derive --account main" },
+      { cmd: "wallet-cli derive --seed-id wlt_ab12cd34" },
+    ],
     formatText: TextFormatters.walletDerive,
-    run: async (_ctx, _net, input) => {
-      return wallets.derive(input.seedId, input.index, input.label);
+    run: async (ctx, _net, input) => {
+      return wallets.derive(input, (message) => ctx.warn(message));
     },
   } satisfies CommandDefinition);
 
-  // ── delete ────────────────────────────────────────────────────────────────
   const deleteFields = z.object({
     account: accountRef("account or wallet to delete, addressed by accountId, label, or address"),
     yes: z
@@ -509,6 +526,8 @@ export function registerWalletCommands(
     examples: [{ cmd: "wallet-cli delete old --yes" }],
     formatText: TextFormatters.walletDelete,
     run: async (ctx, _net, input) => {
+      const deletionWarning = wallets.deletionWarning(input.account);
+      if (deletionWarning) ctx.warn(deletionWarning);
       if (!input.yes) {
         if (!ctx.prompt.isTTY()) {
           throw new UsageError(
@@ -525,19 +544,11 @@ export function registerWalletCommands(
         });
         if (!ok) throw new UsageError("aborted", "deletion not confirmed");
       }
-      return wallets.delete(input.account);
+      return wallets.delete(input.account, (warning) => ctx.warn(warning));
     },
   } satisfies CommandDefinition);
 
-  // ── backup ────────────────────────────────────────────────────────────────
-  // Writes the secret + metadata to a 0600 FILE (never stdout/envelope): the secret stays off
-  // screen, logs and AI context. stdout returns only metadata + the written path.
-  // The master password is primed by `run` itself, not by dispatch (no passwordMode): the account
-  // must be known to be exportable BEFORE a password is demanded. A Ledger/watch account holds no
-  // secret, and a Ledger-only keystore may have no master password at all — verifying against a
-  // missing sentinel always fails, so a dispatch-level gate would trap the user on a prompt no
-  // answer satisfies instead of telling them the account simply cannot be exported.
-  // --password-stdin remains the non-interactive source.
+  // Check exportability before asking for a password; Ledger-only stores may have none.
   const backupFields = z.object({
     account: accountRef(
       "account or wallet to export, addressed by accountId, label, or address; with --records, the account whose exports to list",
@@ -545,9 +556,9 @@ export function registerWalletCommands(
     ),
     keystore: z
       .boolean()
-      .default(false)
+      .optional()
       .describe(
-        "export as a standard Web3 keystore JSON (importable by TronLink and others, encrypted with your master password) instead of the native format",
+        "export as a standard Web3 keystore JSON instead of the native format; omit in an interactive terminal to choose",
       ),
     out: z
       .string()
@@ -567,22 +578,19 @@ export function registerWalletCommands(
       .positive()
       .optional()
       .describe("with --records: maximum records to return; omit for all"),
-    // Optional, not .default(0): a default makes "not given" indistinguishable from "given as 0"
-    // in the refine below, which is how --offset alone slipped past the --records guard. The 0
-    // lives in backupRecords (query.offset ?? 0), so the emitted pagination is unchanged.
+    // Leave omission distinguishable from explicit zero so the --records guard can reject it.
     offset: z.coerce.number().int().min(0).optional().describe("with --records: pagination offset"),
   });
   const RECORD_FILTERS = ["from", "to", "limit", "offset"] as const;
   const backupInput = backupFields.superRefine((v, c) => {
     if (v.records) {
-      // --keystore/--out describe an export; --records exports nothing, so accepting them would
-      // silently ignore what the caller asked for.
       for (const flag of ["keystore", "out"] as const) {
         if (v[flag] !== undefined && v[flag] !== false) {
           c.addIssue({
             code: "custom",
             path: [flag],
             message: `--${camelToKebab(flag)} exports a file; it cannot be combined with --records`,
+            params: { errorCode: "invalid_option" },
           });
         }
       }
@@ -607,7 +615,8 @@ export function registerWalletCommands(
   });
   reg.add({
     path: ["backup"],
-    network: "none",
+    // The selected network chooses which family key a keystore export contains.
+    network: "optional",
     wallet: "none",
     auth: "required",
     interactive: true,
@@ -626,10 +635,7 @@ export function registerWalletCommands(
       "each secret went to. Imports are not logged. The log keeps the most recent 1000 entries.",
     fields: backupFields,
     input: backupInput,
-    // Log filters are never interrogated — a listing is meant to be re-run with a narrower flag, not
-    // negotiated one prompt at a time.
     promptHints: { from: "skip", to: "skip", limit: "skip", offset: "skip" },
-    // --records audits: nothing is exported, so there is no account to pick and no file to name.
     skipGapFill: (argv) => (argv.records ? ["account", "out"] : []),
     commandIdFor: (input) => (input.records ? "backup.records" : "backup"),
     examples: [
@@ -639,32 +645,54 @@ export function registerWalletCommands(
       { cmd: "wallet-cli backup --records --account main --from 2026-08-01" },
     ],
     formatText: TextFormatters.walletBackup,
-    run: async (ctx, _net, input) => {
+    run: async (ctx, network, input) => {
       if (input.records) {
-        return wallets.backupRecords({
+        const { records, pagination } = wallets.backupRecords({
           from: utcInstant(input.from),
           to: utcInstant(input.to),
           limit: input.limit,
           offset: input.offset,
           account: input.account,
         });
+        return {
+          records: records.map((r) => ({
+            ...r,
+            operation: BACKUP_OPERATION_SPELLING[r.operation],
+          })),
+          pagination,
+        };
       }
-      const account = input.account!; // guaranteed by backupInput's refine
+      const account = input.account!;
       wallets.assertExportable(account);
+      const family = (network ?? ctx.networkRegistry.resolveDefault()).family;
+      // Password-stdin skips format prompts and defaults to native backup.
+      const keystore =
+        input.keystore ??
+        (ctx.prompt.isTTY() && !ctx.secrets.has("password")
+          ? await ctx.prompt.select({
+              label: "Backup format",
+              choices: [
+                {
+                  value: false,
+                  label: "Native wallet backup (recovery phrase for the whole HD wallet)",
+                },
+                {
+                  value: true,
+                  label: `Web3 keystore (single ${family.toUpperCase()} private key)`,
+                },
+              ],
+            })
+          : false);
       await ctx.secrets.primePassword({
         mode: "verify",
         verify: (pw) => wallets.verifyPassword(pw),
       });
-      return input.keystore
-        ? wallets.backupKeystore(account, input.out, ctx.secrets.read("password"))
-        : wallets.backup(account, input.out);
+      return keystore
+        ? wallets.backupKeystore(account, input.out, ctx.secrets.read("password"), family)
+        : wallets.backup(account, input.out, (m) => ctx.warn(m));
     },
   } satisfies CommandDefinition);
 
-  // ── change-password ───────────────────────────────────────────────────────
-  // Verify old, prompt for the new one, confirm, then re-encrypt every software wallet keystore.
-  // TTY-only (secretsTtyOnly): both passwords are entered interactively — no stdin source, no argv.
-  // Sibling of `backup` — both are password-gated keystore secret operations.
   const changePasswordFields = z.object({
     yes: z
       .boolean()
@@ -679,19 +707,19 @@ export function registerWalletCommands(
     passwordMode: "verify",
     interactive: true,
     secretsTtyOnly: true,
-    requires: ["the new master password — entered interactively in a TTY"],
+    requiresAfterAuth: ["the new master password — entered interactively in a TTY"],
     summary: "Change the master password (re-encrypt keystores)",
     description:
       "Change the master password. Re-encrypts every software wallet keystore with the\n" +
       "new password (Ledger / watch-only accounts are unaffected). Passwords are read\n" +
-      "interactively from the TTY (hidden input); they never touch argv or stdin.",
+      "interactively from the TTY (hidden input); they never touch argv or stdin.\n" +
+      "If a write fails, the error says which password is in effect.",
     fields: changePasswordFields,
     input: changePasswordFields,
     examples: [{ cmd: "wallet-cli change-password" }],
     formatText: TextFormatters.passwordChanged,
     run: async (ctx, _net, input) => {
-      // old password: already verified and primed by dispatch (passwordMode: "verify"), from the TTY.
-      // secretsTtyOnly guarantees a TTY here (dispatch rejects --password-stdin / fails fast otherwise).
+      // Dispatch has verified and primed the current password from the TTY.
       const oldPassword = ctx.secrets.read("password");
 
       const newPassword = await ctx.prompt.hidden({
@@ -714,7 +742,7 @@ export function registerWalletCommands(
             "password change needs confirmation: pass --yes or run in a terminal",
           );
         }
-        const count = countSoftwareWallets(wallets);
+        const count = wallets.softwareWalletCount();
         const ok = await ctx.prompt.confirm({
           label: `Re-encrypt ${count} software wallet(s) with the new password?`,
         });
@@ -723,15 +751,4 @@ export function registerWalletCommands(
       return wallets.changePassword(oldPassword, newPassword);
     },
   } satisfies CommandDefinition);
-}
-
-/** distinct software (seed/privateKey) wallets — the N in the change-password confirm prompt. */
-function countSoftwareWallets(wallets: WalletService): number {
-  const ids = new Set(
-    wallets
-      .list()
-      .filter((a) => a.type === "seed" || a.type === "privateKey")
-      .map((a) => a.accountId.split(".")[0]),
-  );
-  return ids.size;
 }

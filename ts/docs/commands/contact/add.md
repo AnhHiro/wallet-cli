@@ -14,6 +14,10 @@ Saves a recipient (name → address) to the local address book. The name can the
 
 The name must be 1–64 characters and must not look like an address (so it can't be confused with a literal `--to` address).
 
+A contact belongs to one chain family, inferred from the address itself — this command has no family or network selector. A malformed address, or one belonging to no supported family, is refused with `invalid_address`; family compatibility is checked later, when a chain command uses the contact.
+
+Contact names are unique across both families, including concurrent additions. TRON base58 comparison preserves case. EVM address comparison ignores case.
+
 ## Options
 
 | Option | Description |
@@ -25,22 +29,22 @@ Plus the [global options](../index.md#global-options-every-command). `name` and 
 ## Examples
 
 ```bash
-wallet-cli contact add alice TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub --note "Alice mainnet"
+wallet-cli contact add alice TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c --note "Alice mainnet"
 ```
 
 ```console
 ✅ Contact added
   Name     alice
-  Address  TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub
+  Address  TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c
   Note     Alice mainnet
 ```
 
 ```bash
-wallet-cli contact add alice TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub --note "Alice mainnet" -o json
+wallet-cli contact add alice TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c --note "Alice mainnet" -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"contact.add","data":{"name":"alice","address":"TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub","note":"Alice mainnet","family":"tron"},"meta":{"durationMs":4,"warnings":[]}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"contact.add","data":{"name":"alice","address":"TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c","note":"Alice mainnet"},"meta":{"durationMs":4,"warnings":[]}}
 ```
 
 ## Output
@@ -50,11 +54,10 @@ wallet-cli contact add alice TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub --note "Alice ma
 | `name` | string | Contact name |
 | `address` | string | Recipient address |
 | `note` | string \| null | The note, or `null` |
-| `family` | string | Chain family (`tron`) |
 
 ## Exit status
 
-`0` success · `1` execution failure (`already_exists` — the name is taken, `limit_exceeded` — the address book is full). The address book is a local file: `encoding_error` if it cannot be decoded, `insecure_permissions` if it is a symlink or group/world-readable (`chmod 600` it). · `2` usage error (`invalid_value` — bad address checksum, or an invalid name).
+`0` success · `1` execution failure (`encoding_error` — the local address book cannot be decoded; `insecure_permissions` — it is a symlink or group/world-readable, so `chmod 600` it) · `2` usage error (`already_exists` — the name or address is taken; `limit_exceeded` — the address book is full; `invalid_address` — the address is not valid for a supported family; `invalid_value` — an invalid name or note).
 
 ## See also
 

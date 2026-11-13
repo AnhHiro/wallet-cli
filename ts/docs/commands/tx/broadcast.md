@@ -6,25 +6,39 @@ Broadcast a presigned transaction.
 
 ```
 wallet-cli tx broadcast (--hex <hex> | --file <path> | --transaction <json> | --tx-stdin)
-                        [--dry-run] --network <id> [options]
+                        [--dry-run] [--network <id>] [options]
 ```
 
 ## Description
 
-Submits a transaction that was signed elsewhere. No wallet unlock is needed; the transaction is already signed. The signed input can be **hex** — `--hex` inline or `--file` from a file (the format emitted by `--sign-only` and `tx sign`) — or **JSON** — `--transaction` inline or `--tx-stdin` from stdin. Exactly one of the four; prefer `--file` for long hex.
+Submits a transaction that was signed elsewhere, on TRON or EVM networks alike. No wallet unlock is needed; the transaction is already signed. The signed input can be **hex** — `--hex` inline or `--file` from a file (the format emitted by `--sign-only` and `tx sign`; protobuf on TRON, RLP `0x02…` on EVM) — or **JSON** — `--transaction` inline or `--tx-stdin` from stdin, both **TRON only**. Exactly one of the four; prefer `--file` for long hex, and `--file` / `--hex` in scripts that may target either family.
 
-A presigned transaction carries no network of its own, so pass `--network` to say which network to broadcast to (falls back to the config default network when omitted).
+TRON signed transactions carry no network id of their own. EVM signed transactions do carry an EIP-155 chain id, but `--network` still selects the endpoint, and the CLI rejects the transaction when that chain id does not match. Omitted, `--network` falls back to the config default.
 
 ### Validation before submission
 
-Broadcasting is not blind. Whatever form the transaction arrives in, it is decoded and checked first, and a transaction that cannot succeed is rejected locally instead of being sent:
+Broadcasting is not blind. Whatever form the transaction arrives in, it is decoded and checked first, and a transaction that cannot succeed is rejected locally instead of being sent.
+
+**TRON:**
 
 - **expired** → `tx_expired`
+- **built for another chain** — its reference block is not on the selected network → `chain_id_mismatch`
+- a **reference block newer than the node's head** → `rpc_error`; retry once the node has caught up, or use a node that is in sync
 - **insufficient signature weight** → `not_authorized`, naming the missing weight
 
 That check is what makes this safe as the last step of a multi-signature workflow: a transaction that has not yet reached its permission threshold never reaches the node.
 
-> A transaction with more than one signature incurs an extra **1 TRX multi-sig fee** on-chain at broadcast; it is reported as `multiSignFeeSun` in both dry-run and real broadcasts.
+**EVM:**
+
+- **unsigned** → `invalid_transaction`
+- **built for another chain** → `chain_id_mismatch`, naming both chain ids
+- a **spent nonce** → `nonce_too_low`
+- a **balance below value + fee ceiling** → `insufficient_balance`
+- a **nonce ahead of the account's next** is not fatal — it is reported as a warning, because the transaction is valid and simply stays queued until the gap is filled
+
+The reported `txId` is derived from the transaction's own bytes, never taken from the node — the hash of a signed transaction is a property of the transaction, and a node that names a different one is not allowed to redirect what you poll.
+
+> **TRON:** a transaction with more than one signature incurs an extra **1 TRX multi-sig fee** on-chain at broadcast; it is reported as `multiSignFeeSun` in both dry-run and real broadcasts.
 
 ## Options
 
@@ -32,36 +46,38 @@ That check is what makes this safe as the last step of a multi-signature workflo
 |---|---|
 | `--hex <hex>` | Signed transaction hex inline |
 | `--file <path>` | File containing the signed transaction hex (size-capped at just over 1 MiB) |
-| `--transaction <string>` | Signed TRON transaction JSON inline |
-| `--tx-stdin` | Read the signed transaction JSON from stdin (fd 0) |
-| `--dry-run` | Validate signatures, threshold, expiration, and the dynamic multi-sig fee **without broadcasting**; cannot be combined with `--wait` |
-| `--wait` / `--wait-timeout <ms>` | Poll after broadcast until confirmed/failed (cap default 60000) |
+| `--transaction <string>` | **TRON only.** Signed TRON transaction JSON inline |
+| `--tx-stdin` | **TRON only.** Read the signed transaction JSON from stdin (fd 0) |
+| `--dry-run` | Validate **without broadcasting** — signatures, threshold, expiration and the dynamic multi-sig fee on TRON; signature, chain id, nonce and balance on EVM. Cannot be combined with `--wait` or `--no-wait` |
+| `--wait` | Poll after broadcast until confirmed or failed, up to the command deadline (`--timeout`); at the deadline it returns the submitted receipt with a warning. This is the default |
+| `--no-wait` | Return the submitted receipt without polling for confirmation |
 
 Plus the [global options](../index.md#global-options-every-command).
 
 ## Examples
 
-Broadcast a signed hex from a file:
+Broadcast a signed hex from a file, returning at submission with `--no-wait`:
 
 ```bash
-wallet-cli tx broadcast --file tx.signed.hex --network tron:nile
+wallet-cli tx broadcast --file tx.signed.hex --network nile --no-wait
 ```
 
 ```console
 ⏳ Broadcast
-  TxID    72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5
-  Status  pending — not yet on-chain
-! Track it: wallet-cli tx info --network tron:nile --txid 72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5
+  Multi-sign fee  0 TRX
+  TxID            72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5
+  Status          pending — not yet on-chain
+! Track it: wallet-cli tx info --network tron:3448148188 --txid 72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5
 ```
 
 Or inline hex, and the JSON receipt:
 
 ```bash
-wallet-cli tx broadcast --hex 0a02...9f31 --network tron:nile -o json
+wallet-cli tx broadcast --hex 0a02...9f31 --network nile --no-wait -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"tx.broadcast","data":{"kind":"broadcast","stage":"submitted","txId":"72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5"},"meta":{"durationMs":926,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"tx.broadcast","data":{"kind":"broadcast","stage":"submitted","txId":"72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5","transaction":{"txId":"72a315303323125708f426c77b94c5215afd8964ed27d67e49c29b56e29078f5","contractType":"TransferContract","operation":"Transfer TRX","from":"TMSgJxtPw29AFEHMXsjGo4kWV7UwbCToHJ","to":"TVjsyZ7fYF3qLF6BQgPmTEZy1xrNNyVAAA","rawAmount":"1000000","permission":{"id":0,"name":"owner","threshold":1},"currentWeight":1,"missingWeight":0,"thresholdReached":true,"approved":[{"address":"TMSgJxtPw29AFEHMXsjGo4kWV7UwbCToHJ","weight":1}],"expiration":1784388720000,"expired":false,"signatures":1},"multiSignFeeSun":0},"meta":{"durationMs":926,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 ## Output
@@ -70,14 +86,25 @@ wallet-cli tx broadcast --hex 0a02...9f31 --network tron:nile -o json
 
 | Stage | Fields |
 |---|---|
-| default (submit) | `kind`, `stage: "submitted"`, `txId` |
-| `--wait` (confirmed/failed) | above, plus `confirmed`, `blockNumber`, `failed`, and result fields |
+| `--no-wait` (submitted, TRON) | `kind`, `stage: "submitted"`, `txId`, `transaction` (the approval view), `multiSignFeeSun`, and `alreadyKnown: true` when the node already held the transaction |
+| `--no-wait` (submitted, EVM) | `kind`, `stage: "submitted"`, `txId`, and `alreadyKnown: true` when the node had already seen the transaction |
+| `--dry-run` (TRON) | `kind`, `mode: "dry-run"`, `transaction` (the approval view), `multiSignFeeSun` |
+| default or `--wait` (confirmed/failed) | the submit fields, plus `confirmed`, `blockNumber`, `failed`, and result fields — `netUsed` / `feeSun` on TRON, `gasUsed` / `feeWei` / `effectiveGasPriceWei` on EVM |
+| `--dry-run` (EVM) | `kind`, `mode: "dry-run"`, `txId`, `hash`, `address` (recovered signer), `to`, `rawAmount`, `fee` (`feeModel`, `maxCostWei`, `gasLimit`, `maxPerGasWei`), `tx`, and `checks[]` (`name` — `signature` / `chainId` / `nonce` / `balance` — plus `status` (`ok` / `warning` / `skipped`) and `detail`) |
 
-As with `tx send`, the default return point is **submission** — confirm via `--wait` or [`tx status`](status.md).
+On TRON `multiSignFeeSun` is always present — `0` for a single-signature transaction, since the fee applies only from the second signature on — so the text receipt always carries a `Multi-sign fee` row ahead of `TxID`.
+
+If the node cannot be reached, the EVM nonce and balance checks degrade to `status: "skipped"` with a warning rather than failing the command. A node that already holds the transaction sets `alreadyKnown: true` on the receipt rather than failing: on EVM an "already known" reply, on TRON a `DUP_TRANSACTION_ERROR` reply that names the transaction sent. The command then waits for confirmation as usual, so a transaction that failed on chain is still reported as `failed`. Rebroadcasting the same signed transaction is therefore a safe way to reconcile an [unknown outcome](../../machine-interface.md#unknown-outcome-errordetailsoutcome).
+
+As with `tx send`, the command waits for confirmation by default; with `--no-wait` it returns at **submission** — confirm later with [`tx status`](status.md).
 
 ## Exit status
 
-`0` submitted · `1` execution failure (node rejected the tx, timeout) · `2` usage error (more than one, or none, of the input sources).
+`0` submitted · `1` execution failure (node rejected the tx, `timeout`, `rpc_error`, `invalid_node_response`; `chain_id_mismatch`; `tx_expired` / `not_authorized` on TRON; `invalid_transaction`, `nonce_too_low`, `insufficient_balance` on EVM) · `2` usage error (more than one, or none, of the input sources; `invalid_option` — `--transaction` / `--tx-stdin` on an EVM network).
+
+A `timeout`, `rpc_error` or `invalid_node_response` from submission includes the locally computed signed transaction id in `error.details.txId` and [`error.details.outcome: "unknown"`](../../machine-interface.md#unknown-outcome-errordetailsoutcome); text output shows the id too. Check it with [`tx status`](status.md) before sending again. An EVM reply with no RPC error and no valid transaction hash, or a TRON reply without explicit acceptance or a rejection reason, is `invalid_node_response`: it does not prove rejection. For the same reason an EVM JSON-RPC error is `rpc_error` unless its message names a known rejection (such as `nonce too low`) or its code says the node refused the transaction (`-32003`) or did not process the request; a proxy timeout (`-32002`), an internal error (`-32603`) and any other `-32000` reply count as unknown. So does a TRON reply coded `OTHER_ERROR` or `NOT_ENOUGH_EFFECTIVE_CONNECTION`, and a `DUP_TRANSACTION_ERROR` that names no transaction or another one. Definite rejections and failures before submission gain neither `details.txId` nor `details.outcome`.
+
+Note that `--dry-run` exits **non-zero** on a transaction that would fail — that is the answer a script is asking for.
 
 ## See also
 

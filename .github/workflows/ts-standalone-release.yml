@@ -4,13 +4,14 @@ on:
   push:
     branches:
       - master
+      - "release_*"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  NODE_VERSION: "20"
+  NODE_VERSION: "22"
 
 jobs:
   quality:
@@ -28,6 +29,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          # The runner image can lag behind the security releases that `engines` requires.
+          check-latest: true
           cache: npm
           cache-dependency-path: ts/package-lock.json
 
@@ -93,6 +96,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
+          # The runner image can lag behind the security releases that `engines` requires.
+          check-latest: true
           cache: npm
           cache-dependency-path: ts/package-lock.json
 

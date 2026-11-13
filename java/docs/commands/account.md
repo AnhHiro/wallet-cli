@@ -4,11 +4,16 @@ Query and update on-chain accounts, manage account metadata, and view local reco
 
 ## How to create account
 
-You can create accounts by transferring funds to non-existing accounts, or by initiating a transaction to create an account using the **CreateAccount** command. Transferring to a non-existent account has a minimum restriction amount of **1 TRX**. Creating an account through the `CreateAccount` command still burns **1 TRX**.
+You can create accounts by transferring funds to non-existing accounts, or by initiating a transaction to create an account using the **CreateAccount** command. Either way the payer covers the cost of creating the account, which has two parts:
+
+- `getCreateNewAccountFeeInSystemContract` — always burned from the payer's TRX balance (1,000,000 SUN = **1 TRX** on mainnet today).
+- The transaction's bandwidth — taken from the payer's **staked** bandwidth if there is enough of it (the free daily bandwidth does not count here). Only when staked bandwidth is insufficient does the chain burn `getCreateAccountFee` instead (100,000 SUN = **0.1 TRX** on mainnet today).
+
+So creating an account costs 1 TRX when the payer has enough staked bandwidth, and 1.1 TRX when it does not. Both parameters are proposal-adjustable; read them with `getchainparameters` instead of assuming fixed values.
 
 ## CreateAccount
 
-Create a new account with an inactive address, burning a 1-TRX handling fee for it.
+Create a new account with an inactive address. The payer covers the account-creation cost described above: `getCreateNewAccountFeeInSystemContract` (1 TRX on mainnet today), plus `getCreateAccountFee` (0.1 TRX) only if the payer lacks enough staked bandwidth.
 
 ```console
 > CreateAccount [OwnerAddress] Address
@@ -43,12 +48,14 @@ Before sign transaction hex string is 0a84010a0291a422082bfcd3bb597f3d4040e0cff9
 Please confirm and input your permission id, if input y/Y means default 0, other non-numeric characters will cancel transaction.
 y
 Please choose your key for sign.
-The 1th keystore file name is TJEEKTmaVTYSpJAxahtyuofnDSpe2seajB.json
-The 2th keystore file name is TX1L9xonuUo1AHsjUZ3QzH8wCRmKm56Xew.json
-The 3th keystore file name is TVuVqnJFuuDxN36bhEbgDQS7rNGA5dSJB7.json
-The 4th keystore file name is Ledger-TRvVXgqddDGYRMx3FWf2tpVxXQQXDZxJQe.json
-The 5th keystore file name is TYXFDtn86VPFKg4mkwMs45DKDcpAyqsada.json
-Please choose between 1 and 5
+
+No.  Address                                    Name
+1    TJEEKTmaVTYSpJAxahtyuofnDSpe2seajB         TJEEKTmaVTYSpJAxahtyuofnDSpe2seajB.json
+2    TX1L9xonuUo1AHsjUZ3QzH8wCRmKm56Xew         TX1L9xonuUo1AHsjUZ3QzH8wCRmKm56Xew.json
+3    TVuVqnJFuuDxN36bhEbgDQS7rNGA5dSJB7         TVuVqnJFuuDxN36bhEbgDQS7rNGA5dSJB7.json
+4    TRvVXgqddDGYRMx3FWf2tpVxXQQXDZxJQe         Ledger-TRvVXgqddDGYRMx3FWf2tpVxXQQXDZxJQe.json
+5    TYXFDtn86VPFKg4mkwMs45DKDcpAyqsada         TYXFDtn86VPFKg4mkwMs45DKDcpAyqsada.json
+Please choose No. between 1 and 5, or enter search to search wallets
 1
 After sign transaction hex string is 0a84010a0291a422082bfcd3bb597f3d404083bd9cfae5325a6612640a32747970652e676f6f676c65617069732e636f6d2f70726f746f636f6c2e4163636f756e74437265617465436f6e7472616374122e0a15419d9c2bb5ee381a4396dd49ce42292e756b2e5e4b12154124764e4674179d4578cfc4c833c1ac1a09f6ce56708e8df6efe5321241ce53add4f75fe1838aa7e0a4e2411b3bbfce1d2164d68dac18507ed87e22ae503f65592a1161640834b3c0cef43c28f20b2d335120cc78b6f745a82ea95e451100
 TxId is 26d6fcdfdc0018097ec4166eb140e19ebd597bea2212579d2f6d921b0ad6e56f

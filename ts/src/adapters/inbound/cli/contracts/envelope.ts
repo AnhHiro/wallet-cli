@@ -1,7 +1,3 @@
-/**
- * SharedTypes — output contract (result/error envelopes + progress events)
- * and the global runtime flags parsed off argv.
- */
 import type { ChainFamily } from "../../../../domain/family/index.js";
 import type { OutputMode } from "../../../../domain/types/primitives.js";
 import type { WarningView } from "../../../../domain/types/permission.js";
@@ -13,21 +9,26 @@ export interface ChainView {
   network: string;
   chainId: string;
 }
-/** The window a paginated read returned. ONE location for every list command, so a caller can page
- *  any of them without knowing the payload's shape. `limit: null` = unlimited (no --limit given);
- *  `total: null` = the count is genuinely unknowable, not merely missing — TRON's paginated
- *  endpoints return no count, and computing one would mean transferring every record. Both keys are
- *  always present, so `null` is the single "unknown" signal and absence never has to be handled. */
+// Null limit means unlimited; null total means unknown.
 export interface Pagination {
   offset: number;
   limit: number | null;
   total: number | null;
+  hasMore?: boolean;
+  nextCursor?: string | null;
+}
+export interface QueryEcho {
+  orderBy: string;
+  // May be fixed by the service rather than selected by the caller.
+  sort: string;
 }
 export interface Meta {
   durationMs: number;
   warnings: WarningItem[];
-  /** present on paginated reads only; lifted out of `data` by the json formatter. */
+  // Paginated reads only; the JSON formatter lifts this out of data.
   pagination?: Pagination;
+  // Ordered listings only; the JSON formatter lifts this out of data.
+  query?: QueryEcho;
 }
 export interface ResultEnvelope {
   schema: "wallet-cli.result.v1";
@@ -46,14 +47,12 @@ export interface ErrorEnvelope {
   meta: Meta;
 }
 
-// ═══════════════ global runtime flags parsed off argv ═════════════════════
 export interface Globals {
-  /** absent until the config default is resolved (runner bootstrap / buildExecutionContext). */
+  // Absent until the config default is resolved.
   output?: OutputMode;
   network?: string;
   account?: string;
   timeoutMs?: number;
   verbose: boolean;
   wait?: boolean;
-  waitTimeoutMs?: number;
 }

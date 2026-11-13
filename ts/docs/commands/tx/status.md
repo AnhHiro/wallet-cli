@@ -10,42 +10,66 @@ wallet-cli tx status --txid <id> [options]
 
 ## Description
 
-Reports which step a transaction is at, using **four states**. After sending, scripts and agents poll it to learn whether the tx made it on-chain and succeeded. These four state values are **stable — they won't be renamed or dropped across versions** — so you can program against them (see the `wallet-cli.result.v1` output contract in [machine-interface](../../machine-interface.md)).
+Reports which step a transaction is at, using **four states**, on TRON and EVM networks alike. After sending, scripts and agents poll it to learn whether the tx made it on-chain and succeeded. These four state values are **stable — they won't be renamed or dropped across versions** — so you can program against them (see the `wallet-cli.result.v1` output contract in [machine-interface](../../machine-interface.md)).
 
 | `data.state` | Meaning | Terminal? |
 |---|---|---|
-| `confirmed` | Solidified on chain; `blockNumber` present | yes |
+| `confirmed` | Included in a block, with an execution result / receipt available; `blockNumber` present | yes |
 | `failed` | Included and reverted / rejected | yes |
-| `pending` | Seen by the node, not yet solidified | no — keep polling |
-| `not_found` | Unknown to the queried node (wrong network? not propagated yet?) | no — poll within your own deadline |
+| `pending` | Seen by the node, with no execution result / receipt yet | no — keep polling |
+| `not_found` | Unknown to the queried endpoint (wrong network, not propagated, dropped, or pruned); the outcome is unknown | no — keep polling and reconcile; do not assume failure |
+
+> On TRON, a contract call (`TriggerSmartContract`, `CreateSmartContract`) that is mined while its execution result is still unknown — receipt result `DEFAULT` or no result — is reported as `confirmed` here. Waiting for confirmation on a write treats the same transaction as not yet confirmed and returns `submitted` when the wait ends.
+
+> `confirmed` is an inclusion-and-receipt state, not a finality guarantee. If a workflow needs finality, verify it separately with a TRON SolidityNode view or an EVM finalized-block check.
+
+> A polling deadline that ends in `pending` or `not_found` is still an unknown outcome. Do not record it as a failure, and do not use it as an automatic resend trigger; reconcile the txid against the intended network and endpoint first.
 
 ## Options
 
 | Option | Description |
 |---|---|
-| `--txid <string>` | **Required.** TRON transaction id/hash |
+| `--txid <string>` | **Required.** Transaction id/hash — bare hex on TRON, `0x…` on EVM |
 
 Plus the [global options](../index.md#global-options-every-command).
 
 ## Examples
 
 ```bash
-wallet-cli tx status --txid 7d9b6a08505537f7fd51ed4fb4223ce89098403d26e8d3fe07bdb3d625a46364 --network tron:nile
+wallet-cli tx status --txid 1789b6e3d420d84f21013fa4e18ecd2c60df1accb7101fd71c2511b75835c0cd --network nile
 ```
 
 ```console
-TxID    7d9b6a08505537f7fd51ed4fb4223ce89098403d26e8d3fe07bdb3d625a46364
-Status  confirmed ✅
+TxID           1789b6e3d420d84f21013fa4e18ecd2c60df1accb7101fd71c2511b75835c0cd
+Status         confirmed ✅
+Block          #70,604,611
+Confirmations  19
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"tx.status","data":{"txid":"7d9b6a08505537f7fd51ed4fb4223ce89098403d26e8d3fe07bdb3d625a46364","state":"confirmed","confirmed":true,"failed":false,"blockNumber":68822193},"meta":{"durationMs":1006,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"tx.status","data":{"txid":"1789b6e3d420d84f21013fa4e18ecd2c60df1accb7101fd71c2511b75835c0cd","state":"confirmed","confirmed":true,"failed":false,"blockNumber":70604611,"confirmations":19},"meta":{"durationMs":1817,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
+```
+
+The same query on an EVM network, by `0x` hash:
+
+```bash
+wallet-cli tx status --txid 0x55b0068ef31bce39bbf5b06d456eaef307fd77f96d85ea291f48c1ae4b900d80 --network sepolia -o json
+```
+
+```json
+{"schema":"wallet-cli.result.v1","success":true,"command":"tx.status","data":{"txid":"0x55b0068ef31bce39bbf5b06d456eaef307fd77f96d85ea291f48c1ae4b900d80","state":"confirmed","confirmed":true,"failed":false,"blockNumber":11576586,"confirmations":0},"meta":{"durationMs":408,"warnings":[]},"chain":{"family":"evm","network":"eip155:11155111","chainId":"11155111"}}
 ```
 
 An unknown txid is a **success** with `state: "not_found"` (exit 0) — the query worked; the answer is "not there":
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"tx.status","data":{"txid":"0000…0000","state":"not_found","confirmed":false,"failed":false},"meta":{"durationMs":1022,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"tx.status","data":{"txid":"0000…0000","state":"not_found","confirmed":false,"failed":false},"meta":{"durationMs":1022,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
+```
+
+On EVM, `not_found` also carries a `meta.warnings` entry, because a public endpoint that has pruned its history is indistinguishable from a hash that never existed:
+
+```json
+{"…":"…","data":{"txid":"0x0000…0000","state":"not_found","confirmed":false,"failed":false},"meta":{"durationMs":407,"warnings":["0x0000…0000 is unknown to this endpoint. Public nodes often prune history, so this may mean the node has no record of it rather than that it never existed; try an archival endpoint."]},"chain":{"family":"evm","network":"eip155:11155111","chainId":"11155111"}}
 ```
 
 ## Output
@@ -56,6 +80,9 @@ An unknown txid is a **success** with `state: "not_found"` (exit 0) — the quer
 | `state` | string | `confirmed` / `failed` / `pending` / `not_found` |
 | `confirmed` / `failed` | boolean | Direct-branch conveniences mirroring `state` |
 | `blockNumber` | number | Present when confirmed |
+| `confirmations` | number | Blocks on top of the including block; present when confirmed |
+
+On TRON, a mined transaction with top-level `FAILED` or a failing receipt result has `state: "failed"`. A receipt result of `DEFAULT` alone is not failure. Contract submission commands keep polling for an execution result before reporting confirmation.
 
 ## Exit status
 

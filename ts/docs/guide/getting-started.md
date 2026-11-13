@@ -33,25 +33,25 @@ HD  wlt_4473p34m
 └─ [0] main        TMSgJxtPw29AFEHMXsjGo4kWV7UwbCToHJ  (active)
 ```
 
-The `T…` string is your TRON address, same on every network. `(active)` marks the account commands act on by default; switch with `wallet-cli use <label>`.
+The `T…` string is your TRON address, the same on every TRON network. The account also has an EVM `0x` address, derived from the same seed — `wallet-cli current` prints both, and `list` shows whichever family `--network` selects. `(active)` marks the account commands act on by default; switch with `wallet-cli use <label>`.
 
 ## 2. Get test TRX
 
 Open the Nile faucet at [nileex.io/join/getJoinPage](https://nileex.io/join/getJoinPage), find the "Get 2000 test coins" section, paste your `T…` address, pass the captcha, and submit (once per day; arrives in under a minute). Then verify it arrived:
 
 ```bash
-wallet-cli account balance --network tron:nile
+wallet-cli account balance --network nile
 ```
 
 ```console
 Label    main
-Balance  1976.489 TRX
+Balance  1,976.489 TRX
 ```
 
 Tip: set Nile as your default so you can drop `--network` while learning:
 
 ```bash
-wallet-cli config defaultNetwork tron:nile
+wallet-cli config defaultNetwork tron:3448148188
 ```
 
 ## 3. Send your first transaction
@@ -59,32 +59,34 @@ wallet-cli config defaultNetwork tron:nile
 Sending a transaction takes your master password on stdin via `--password-stdin`:
 
 ```bash
-printf '%s' "$MY_PASSWORD" | wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network tron:nile --password-stdin
+printf '%s' "$MY_PASSWORD" | wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network nile --password-stdin
 ```
 
 **Tip — a password manager is preferable** (setup in step 1). Pipe the password straight from it:
 
 ```bash
-op read "op://Private/wallet-cli/password" | wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network tron:nile --password-stdin
+op read "op://Private/wallet-cli/password" | wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network nile --password-stdin
 ```
 
-The transaction is signed and **submitted**. Submission is not confirmation — check where it landed:
+The transaction is signed, submitted, and followed until it is confirmed or failed. If the command ends with the transaction still **submitted** (its time limit ran out, or you passed `--no-wait`), check where it landed:
 
 ```bash
-wallet-cli tx status --txid <the txid you got back> --network tron:nile
+wallet-cli tx status --txid <the txid you got back> --network nile
 ```
 
 ```console
-TxID    7d9b6a08505537f7fd51ed4fb4223ce89098403d26e8d3fe07bdb3d625a46364
-Status  confirmed ✅
+TxID           1789b6e3d420d84f21013fa4e18ecd2c60df1accb7101fd71c2511b75835c0cd
+Status         confirmed ✅
+Block          #70,604,611
+Confirmations  19
 ```
 
-`pending` means wait and re-run; `failed` means the chain rejected it (see [troubleshooting](../troubleshooting.md)). To make `tx send` block until confirmed, add `--wait`.
+`pending` means wait and re-run; `failed` means the chain rejected it (see [troubleshooting](../troubleshooting.md)).
 
 Not sure about a transaction? Rehearse it first — `--dry-run` builds and estimates without signing or broadcasting:
 
 ```bash
-wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network tron:nile --dry-run
+wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network nile --dry-run
 ```
 
 ## 4. Where to go next
@@ -96,6 +98,6 @@ wallet-cli tx send --to TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc --amount 1 --network 
 - Full transaction detail and receipts: [`tx info`](../commands/tx/info.md)
 - Your history and holdings: [`account history`](../commands/account/history.md), [`account portfolio`](../commands/account/portfolio.md)
 - Automating any of this: [Scripting guide](scripting.md)
-- What `tron:nile` / `tron:mainnet` actually are: [Networks](../concepts/networks.md)
+- What `tron:3448148188` / `tron:728126428` actually are: [Networks](../concepts/networks.md)
 
 > **Before touching mainnet**: mainnet TRX is real money. Re-check the recipient address, prefer `--dry-run` first, and understand that a confirmed transaction cannot be reversed.

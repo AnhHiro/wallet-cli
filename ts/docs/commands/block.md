@@ -18,12 +18,12 @@ wallet-cli block [<number>] [options]
 
 ## Notes
 
-Requires `--network` (or config.defaultNetwork).
+Requires `--network` (or config.defaultNetwork). Works on TRON and EVM networks; the block number is the selected chain's own height.
 
 ## Examples
 
 ```bash
-wallet-cli block --network tron:nile
+wallet-cli block --network nile
 ```
 
 ```console
@@ -33,28 +33,72 @@ Transactions  212
 ```
 
 ```bash
-wallet-cli block 69093315 --network tron:nile -o json
+wallet-cli block 69093315 --network nile -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"block","data":{"block":{"blockID":"0000000041e6a3c3…","block_header":{"raw_data":{"number":69093315,"txTrieRoot":"…","witness_address":"41…","parentHash":"…","version":31,"timestamp":1783783761000},"witness_signature":"…"},"transactions":[{…}]}},"meta":{"durationMs":126,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"block","data":{"block":{"blockID":"0000000041e6a3c3…","block_header":{"raw_data":{"number":69093315,"txTrieRoot":"…","witness_address":"41…","parentHash":"…","version":31,"timestamp":1783783761000},"witness_signature":"…"},"transactions":[{}]},"number":69093315,"timestampMs":1783783761000,"transactionCount":212},"meta":{"durationMs":126,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
+```
+
+On an EVM network the text summary carries the gas and fee figures a block actually has:
+
+```bash
+wallet-cli block --network sepolia
+```
+
+```console
+Number        #11,576,585
+Hash          0xfbebc32aba432b2ae721b062cf40d2cb685f1ba617f0f5d3fc8e768b53a8d820
+Parent hash   0x222ceb99e43496964a36be6ee98137f4ca51d4e2d88a25c56bf48007d57ec0bd
+Time          2026-08-27 08:06:24 UTC
+Transactions  197
+Gas used      18,543,035 / 60,000,000
+Base fee      1.119025 gwei
 ```
 
 ## Output
 
-`data.block` is the raw TRON block as returned by the node, unmodified. Its exact shape follows the node's block structure; the key fields are below (large hashes and the full transaction list are elided as `…` above).
+`data.block` is the raw block as returned by the node, unmodified — a TRON block object on TRON, an `eth_getBlockByNumber` result on EVM. Its exact shape follows the node's block structure; the key fields are below (large hashes and the full transaction list are elided as `…` above). On EVM, `data` also carries the block's decoded fields beside `data.block`.
+
+TRON also reports a normalized summary beside `block`. A block without `block_header.raw_data` fails with `invalid_node_response`; within the header, an omitted `number` or `timestamp` reads as `0` (the genesis block):
 
 | Field | Type | Meaning |
 |---|---|---|
+| `number` | number | Block height |
+| `timestampMs` | number | Block time (ms since epoch, UTC) |
+| `transactionCount` | number | Transactions in the block |
 | `block.blockID` | string | Block hash |
 | `block.block_header.raw_data.number` | number | Block height |
 | `block.block_header.raw_data.timestamp` | number | Block time (ms since epoch, UTC) |
 | `block.block_header.raw_data.witness_address` | string | Producing SR, hex (`41…`) |
 | `block.transactions` | array | Transactions in the block (omitted when empty) |
 
+EVM — the node's own hex QUANTITY encoding throughout:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `block.hash` / `block.parentHash` | string | Block and parent hash |
+| `block.number` | string | Block height, hex (`"0xb0a509"`) |
+| `block.timestamp` | string | Block time, hex seconds since epoch |
+| `block.gasUsed` / `block.gasLimit` | string | Gas consumed and authorised, hex |
+| `block.baseFeePerGas` | string | Base fee per gas, hex wei |
+| `block.miner` | string | Address credited with the block |
+| `block.transactions` | array | Transaction hashes, or full objects, as the node returns them |
+
+EVM decoded fields, beside `data.block`. A block without a number or timestamp fails with `invalid_node_response`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `number` | number | Block height |
+| `timestamp` | number | Block time, ms since epoch (UTC) |
+| `hash` / `parentHash` | string | Block and parent hash; omitted when the node omits them |
+| `transactionCount` | number | Transactions in the block; omitted when the node omits the list |
+| `gasUsed` / `gasLimit` | string | Gas consumed and authorised, decimal; omitted when absent |
+| `baseFeeWei` | string | Base fee per gas, decimal wei; omitted before EIP-1559 |
+
 ## Exit status
 
-`0` success · `1` execution failure · `2` usage error. See [machine-interface](../machine-interface.md).
+`0` success · `1` execution failure (`invalid_node_response` — a block without its header or decoded fields) · `2` usage error (`invalid_value` — a block number that is not a non-negative integer, such as `abc`, `1.5` or `-1`; nothing is requested). See [machine-interface](../machine-interface.md).
 
 ## See also
 

@@ -1,22 +1,38 @@
 import type { TextFormatter, TextRenderContext } from "../contracts/index.js";
-import { RESOURCES, resourceOfRpcCode, type Resource } from "../../../../domain/resources/index.js";
-import { fromBaseUnits } from "../../../../domain/amounts/index.js";
 import {
+  formatAmount,
   formatScalar,
-  formatInt,
   formatUsd,
-  formatSun,
+  formatUsdPrice,
   formatTime,
   num,
   quote,
 } from "./scalars.js";
-import { type Obj, type Pair, asObj, query, receipt, table, ok, fail, warn } from "./layout.js";
+import {
+  type Obj,
+  type Pair,
+  asObj,
+  query,
+  receipt,
+  table,
+  ok,
+  fail,
+  unknown,
+  warn,
+} from "./layout.js";
+import { FAMILY_RENDER, renderFamily, renderSymbol } from "./family.js";
 
-/** humanize a raw base-unit balance: scale by `decimals` when known, else show the raw integer. */
 function humanBalance(d: Obj): string {
   return d.decimals !== undefined
-    ? fromBaseUnits(String(d.balance ?? "0"), num(d.decimals, 0))
+    ? formatAmount(d.balance ?? "0", num(d.decimals, 0))
     : formatScalar(d.balance);
+}
+
+// rawBalance is in base units; balance is already scaled.
+function holdingBalance(h: Obj): string {
+  return h.rawBalance !== undefined && h.rawBalance !== null && h.decimals !== undefined
+    ? formatAmount(h.rawBalance, num(h.decimals, 0))
+    : formatScalar(h.balance);
 }
 
 export const AccountFormatters = {
@@ -68,8 +84,8 @@ export const AccountFormatters = {
     const holdings = (Array.isArray(d.holdings) ? d.holdings : []).map(asObj);
     const rows = holdings.map((h) => [
       String(h.symbol ?? ""),
-      h.balanceUnavailable ? "unavailable" : formatScalar(h.balance),
-      h.priceUsd === null || h.priceUsd === undefined ? "-" : `$${formatUsd(h.priceUsd)}`,
+      h.balanceUnavailable ? "unavailable" : holdingBalance(h),
+      h.priceUsd === null || h.priceUsd === undefined ? "-" : `$${formatUsdPrice(h.priceUsd)}`,
       h.valueUsd === null || h.valueUsd === undefined ? "-" : `$${formatUsd(h.valueUsd)}`,
     ]);
     const total =
@@ -111,88 +127,38 @@ export const AccountFormatters = {
 };
 
 function renderAccountInfo(d: Obj, ctx: TextRenderContext): string {
-  const account = asObj(d.account);
-  const owner = asObj(account.owner_permission);
-  const active = Array.isArray(account.active_permission) ? account.active_permission.length : 0;
-  const created = account.create_time
-    ? new Date(Number(account.create_time)).toISOString().slice(0, 10)
-    : "";
-  const ownerKeys = Array.isArray(owner.keys) ? owner.keys.length : "?";
-  const resources = asObj(d.resources);
-  const bandwidth = asObj(resources.bandwidth);
-  const energy = asObj(resources.energy);
   const pairs: Pair[] = [];
   if (ctx.accountLabel) pairs.push(["Label", ctx.accountLabel]);
-  pairs.push(["Address", String(d.address ?? "")]);
-  pairs.push(["Balance", `${formatSun(account.balance)} TRX`]);
-  const staked = stakedSummary(account);
-  if (staked) pairs.push(["Staked", staked]);
-  if (resources.energy)
-    pairs.push(["Energy", `used ${formatInt(energy.used)} / ${formatInt(energy.limit)}`]);
-  if (resources.bandwidth)
-    pairs.push(["Bandwidth", `used ${formatInt(bandwidth.used)} / ${formatInt(bandwidth.limit)}`]);
-  pairs.push(["Created", created]);
-  pairs.push([
-    "Permissions",
-    `owner ${String(owner.threshold ?? "?")}-of-${ownerKeys}, ${active} active group${active === 1 ? "" : "s"}`,
-  ]);
+  pairs.push(...FAMILY_RENDER[renderFamily(ctx)].accountInfoRows(d, renderSymbol(ctx)));
   return query(pairs);
 }
 
-/** Sum FreezeBalanceV2 stakes into a "<total> TRX (energy <e> + bandwidth <b>)" summary. */
-function stakedSummary(account: Obj): string {
-  const frozen = Array.isArray(account.frozenV2) ? account.frozenV2.map(asObj) : [];
-  // frozenV2's bandwidth entries carry no `type`, so an unrecognized code folds into bandwidth.
-  const sums = new Map<Resource, bigint>(RESOURCES.map((r) => [r, 0n]));
-  for (const f of frozen) {
-    const r = resourceOfRpcCode(String(f.type ?? "")) ?? "bandwidth";
-    const amount = safeUnsignedBigInt(f.amount ?? 0);
-    // An unsafe JS number has already lost precision. Omit the summary instead of presenting a
-    // plausible but incorrect total; the raw account payload remains available in JSON mode.
-    if (amount === null) return "";
-    sums.set(r, (sums.get(r) ?? 0n) + amount);
-  }
-  const total = RESOURCES.reduce((t, r) => t + (sums.get(r) ?? 0n), 0n);
-  if (total === 0n) return "";
-  const parts = RESOURCES.map((r) => `${r} ${formatSun(sums.get(r) ?? 0n)}`).join(" + ");
-  return `${formatSun(total)} TRX (${parts})`;
-}
-
-function safeUnsignedBigInt(value: unknown): bigint | null {
-  if (typeof value === "bigint") return value >= 0n ? value : null;
-  if (typeof value === "number") {
-    return Number.isSafeInteger(value) && value >= 0 ? BigInt(value) : null;
-  }
-  if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value);
-  return null;
-}
+const HISTORY_STATUS: Record<string, () => string> = { ok, failed: fail, unknown };
 
 function historyRow(r: Obj): string[] {
-  const ts = r.time ?? r.block_timestamp ?? r.timestamp;
-  const type = r.type ?? r.transfer_type ?? r.direction ?? "";
-  const amount = r.amount ?? r.value ?? r.quant ?? "";
-  const symbol =
-    r.symbol ??
-    (r.token_info && typeof r.token_info === "object" ? asObj(r.token_info).symbol : undefined);
-  const counterparty = r.counterparty ?? r.to ?? r.from ?? "";
-  const status = r.status === "failed" || r.confirmed === false ? "failed" : "ok";
   return [
-    formatTime(ts),
-    String(type),
-    `${formatScalar(amount)}${symbol ? ` ${String(symbol)}` : ""}`,
-    String(counterparty),
-    status === "ok" ? ok() : fail(),
+    formatTime(r.time),
+    String(r.type ?? ""),
+    historyAmount(r),
+    String(r.counterparty ?? ""),
+    (HISTORY_STATUS[String(r.status)] ?? unknown)(),
   ];
 }
 
-/** account display id for receipts: the centrally-injected --account label when present,
- *  else the full on-chain address. Callers add their own quoting where wanted. */
+function historyAmount(r: Obj): string {
+  const unit = r.symbol ? String(r.symbol) : r.assetId ? `TRC10 ${String(r.assetId)}` : "";
+  const amount = r.amount
+    ? formatScalar(r.amount)
+    : r.rawAmount
+      ? `${formatScalar(r.rawAmount)} base units of`
+      : "";
+  return [amount, unit].filter(Boolean).join(" ");
+}
+
 function acct(ctx: TextRenderContext, address: unknown): string {
   return ctx.accountLabel ?? String(address ?? "");
 }
 
-/** identity field pair: prefer the account label, else show the full address — the field
- *  name tracks the value's real meaning (§0.4). */
 function identity(ctx: TextRenderContext, address: unknown): Pair {
   return ctx.accountLabel ? ["Label", ctx.accountLabel] : ["Address", String(address ?? "")];
 }

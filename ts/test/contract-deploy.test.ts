@@ -9,25 +9,12 @@ import { Keystore } from "../src/adapters/outbound/keystore/index.js";
 import { AtomicFileStore } from "../src/adapters/outbound/persistence/fs/index.js";
 import { DETACHED } from "./detached.js";
 
-// Regression coverage for issue #2: `contract deploy` constructor params.
-//   • --constructor-sig was a dead flag (types come from the ABI); it was removed.
-//   • --params must be RAW positional values ([100, "T..."]) — the {type,value} form that
-//     contract call/send use is rejected by TronWeb's createSmartContract ABI encoder, and is now
-//     named as a format error at the command boundary before it gets there (see
-//     commands/contract.deploy.test.ts for that guard's own alignment coverage).
-//
-// The negative case fails at client-side ABI encoding *before* any node call, so it runs
-// hermetically (random key, no network, no funds). The positive/broadcast cases hit real Nile
-// and are gated behind explicit opt-in env flags so `npm test` stays hermetic:
-//   RUN_LIVE=1            → dry-run build against Nile (no broadcast, no funds spent)
-//   RUN_LIVE_BROADCAST=1  → actually deploy + confirm on Nile (spends testnet TRX)
-
 const HERE = dirname(fileURLToPath(import.meta.url));
-const ENTRY = join(process.cwd(), "src", "index.ts");
-const PW = "testpw123A";
+const ENTRY_ARGS = process.env.WALLET_CLI_TEST_ENTRY
+  ? [process.env.WALLET_CLI_TEST_ENTRY]
+  : ["--import", "tsx", join(process.cwd(), "src", "index.ts")];
+const PW = "testpw123A!";
 
-// Minimal init code whose runtime ignores appended constructor args (a known-good Nile deploy
-// payload). Declaring a constructor in the ABI is what drives client-side arg encoding.
 const ABI = JSON.stringify([
   {
     type: "constructor",
@@ -38,10 +25,10 @@ const ABI = JSON.stringify([
     ],
   },
 ]);
+// Init code ignores the constructor arguments appended by ABI encoding.
 const BYTECODE =
   "6080604052348015600f57600080fd5b50603f80601d6000396000f3fe6080604052600080fdfea2646970667358fe";
 const ARG_ADDR = "TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7";
-// Expected ABI encodings that must appear in the built CreateSmartContract bytecode.
 const ENC_CAP = "0".repeat(62) + "64"; // uint256(100)
 const ENC_OWNER = "74472e7d35395a6b5add427eecb7f4b62ad2b071"; // ARG_ADDR as a 20-byte EVM address
 
@@ -62,23 +49,23 @@ function deploy(
   params: string,
   opts: { dryRun?: boolean; wait?: boolean; timeoutMs?: number } = {},
 ) {
-  const globals = ["--output", "json", "--network", "tron:nile"];
-  if (opts.wait) globals.push("--wait"); // --wait is a global flag (before the subcommand)
+  const globals = ["--output", "json", "--network", "tron:3448148188"];
+  if (opts.wait) globals.push("--wait");
   const local = [
     "contract",
     "deploy",
     "--abi",
     ABI,
-    "--bytecode",
+    "--code",
     BYTECODE,
     "--fee-limit",
     "1000000000",
-    "--params",
+    "--constructor-params",
     params,
   ];
   if (opts.dryRun) local.push("--dry-run");
   local.push("--password-stdin");
-  const r = spawnSync(process.execPath, ["--import", "tsx", ENTRY, ...globals, ...local], {
+  const r = spawnSync(process.execPath, [...ENTRY_ARGS, ...globals, ...local], {
     input: PW + "\n",
     encoding: "utf8",
     env: { ...process.env, WALLET_CLI_HOME: HOME, NO_COLOR: "1" },
@@ -93,30 +80,27 @@ describe("contract deploy — constructor params (issue #2)", () => {
     HOME = mkdtempSync(join(tmpdir(), "wcli-deploy-"));
   });
 
-  it("rejects the {type,value} param form (raw positional values are required)", () => {
-    seed(randomBytes(32).toString("hex")); // rejected at the command boundary → hermetic
-    const out = deploy(TYPED_PARAMS, { dryRun: true });
+  it("rejects the bare positional form (--constructor-params takes {type,value})", () => {
+    seed(randomBytes(32).toString("hex"));
+    const out = deploy(RAW_PARAMS, { dryRun: true });
     expect(out.success).toBe(false);
-    // A malformed call, not a failed execution: deterministic on retry, so exit 2 / invalid_value.
-    // (Before the guard this reached TronWeb and came back as rpc_error / `invalid BigNumberish
-    // value (argument="value")` — same refusal, worded in ethers' internals.)
     expect(out.error.code).toBe("invalid_value");
-    expect(out.error.message).toMatch(/raw positional values/i);
+    expect(out.error.message).toMatch(/type/i);
   });
 
   const PK = loadTestPrivateKey();
   const LIVE = process.env.RUN_LIVE === "1" || process.env.RUN_LIVE_BROADCAST === "1";
 
   describe.runIf(LIVE && !!PK)("on Nile (live)", () => {
-    it("builds a constructor-arg deploy (dry-run) with raw positional params", () => {
+    it("builds a constructor-arg deploy (dry-run) with typed constructor params", () => {
       seed(PK!);
-      const out = deploy(RAW_PARAMS, { dryRun: true });
+      const out = deploy(TYPED_PARAMS, { dryRun: true });
       expect(out.success).toBe(true);
       expect(out.data.mode).toBe("dry-run");
       const bytecode: string =
         out.data.tx.raw_data.contract[0].parameter.value.new_contract.bytecode;
-      expect(bytecode).toContain(ENC_CAP); // uint256(100) appended
-      expect(bytecode.toLowerCase()).toContain(ENC_OWNER); // address arg appended
+      expect(bytecode).toContain(ENC_CAP);
+      expect(bytecode.toLowerCase()).toContain(ENC_OWNER);
       expect(out.data.tx.contract_address).toBeTruthy();
     });
 
@@ -124,7 +108,7 @@ describe("contract deploy — constructor params (issue #2)", () => {
       "deploys and confirms a constructor-arg contract on-chain",
       () => {
         seed(PK!);
-        const out = deploy(RAW_PARAMS, { wait: true, timeoutMs: 120_000 });
+        const out = deploy(TYPED_PARAMS, { wait: true, timeoutMs: 120_000 });
         expect(out.success).toBe(true);
         expect(out.data.stage).toBe("confirmed");
         expect(out.data.confirmed).toBe(true);
@@ -137,7 +121,6 @@ describe("contract deploy — constructor params (issue #2)", () => {
   });
 });
 
-// Credential lookup: env override first, then the git-ignored .private fixtures.
 function loadTestPrivateKey(): string | undefined {
   if (process.env.TEST_TRON_PRIVATE_KEY) return process.env.TEST_TRON_PRIVATE_KEY;
   const candidates = [

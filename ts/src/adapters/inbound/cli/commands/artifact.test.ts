@@ -1,8 +1,9 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { readBoundedTextFile } from "./artifact.js";
 
 const roots: string[] = [];
 
@@ -40,5 +41,23 @@ describe("readBoundedTextFile", () => {
       code: "invalid_value",
       message: "transaction hex file must be a regular file",
     });
+  });
+
+  it("trims a trailing newline like an editor or `echo` would leave", () => {
+    const root = mkdtempSync(join(tmpdir(), "wallet-cli-artifact-"));
+    roots.push(root);
+    const path = join(root, "transaction.hex");
+    writeFileSync(path, "0xdeadbeef\n");
+
+    expect(readBoundedTextFile(path, 1024, "transaction hex file")).toBe("0xdeadbeef");
+  });
+
+  it("trims leading/trailing whitespace but leaves internal whitespace alone", () => {
+    const root = mkdtempSync(join(tmpdir(), "wallet-cli-artifact-"));
+    roots.push(root);
+    const path = join(root, "transaction.hex");
+    writeFileSync(path, "  0xdead beef  \n");
+
+    expect(readBoundedTextFile(path, 1024, "transaction hex file")).toBe("0xdead beef");
   });
 });

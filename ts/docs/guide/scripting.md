@@ -2,66 +2,103 @@
 
 How to call wallet-cli from shell scripts and CI. This is the gentle version; the formal contract lives in [machine-interface.md](../machine-interface.md).
 
+## Discovering the surface
+
+Before hard-coding anything, ask the CLI what it supports. One call returns every command, its flags as JSON Schema, which chain families it serves, and the maintained error-code discovery index:
+
+```bash
+wallet-cli --json-schema | jq '.commands[] | select(.id == "tx.send") | {families, examples}'
+```
+
+```bash
+wallet-cli --json-schema | jq '.errorCodes'
+```
+
+Prefer this to scraping `--help`; the catalog is the same source the parser and the help text are generated from.
+
 ## The three habits
 
 **1. Always `-o json`.** Text output is for eyeballs and may change; JSON is the contract. stdout carries exactly one JSON object per run:
 
 ```bash
-wallet-cli account balance --network tron:nile -o json
+wallet-cli account balance --network tron:3448148188 -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"account.balance","data":{"address":"TMSgJxtPw29AFEHMXsjGo4kWV7UwbCToHJ","balance":"1976489000","decimals":6,"symbol":"TRX"},"meta":{"durationMs":1114,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"account.balance","data":{"address":"TMSgJxtPw29AFEHMXsjGo4kWV7UwbCToHJ","balance":"1976489000","decimals":6,"symbol":"TRX"},"meta":{"durationMs":1114,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
-**2. Check the exit code, then `error.code`.** `0` success, `1` runtime failure, `2` you built the command wrong:
+**2. Check the exit code, then `error.code`.** `0` success, `1` runtime failure, `2` you built the command wrong. Two of the exit-`2` codes are worth handling by name when a script switches networks: `family_mismatch` (this command or account does not belong to the selected network's chain family) and `invalid_option` (a flag that belongs to the other family):
 
 ```bash
-if out=$(wallet-cli account balance --network tron:nile -o json); then
+if out=$(wallet-cli account balance --network tron:3448148188 -o json); then
   bal=$(jq -r '.data.balance' <<<"$out")     # raw SUN, as a *string*
 else
   code=$(jq -r '.error.code' <<<"$out")      # e.g. timeout, rpc_error
 fi
 ```
 
-**3. Secrets via stdin, never argv.** Passwords/mnemonics/keys in arguments would end up in shell history and `ps` output:
+**3. Secrets via stdin, never argv.** Passwords/mnemonics/keys in arguments would end up in shell history and `ps` output, and wallet-cli reads no dedicated secret environment variables either:
 
 ```bash
 printf '%s' "$PW" | wallet-cli tx send --to T... --amount 1 \
-  --network tron:nile --password-stdin -o json
+  --network tron:3448148188 --password-stdin -o json
 ```
 
-(`$PW` should come from your secret store, not from a file in the repo. Only one `*-stdin` flag per run.)
+(`$PW` should come from your secret store as a short-lived shell variable for this pipe — not from a file in the repo, and not from a long-lived `export`. Only one `*-stdin` flag per run.)
 
 ## Waiting for confirmation
 
-`tx send` returns at submission. For scripts, the simplest safe form is `--wait`:
+`tx send` waits for confirmation by default and reports the outcome in `data.stage` (`confirmed`, `failed`, or `submitted` when the time limit, or a poll error that cannot be retried unchanged, ends the wait):
 
 ```bash
-wallet-cli tx send --to T... --amount 1 --network tron:nile \
-  --password-stdin --wait --wait-timeout 90000 -o json
+wallet-cli tx send --to T... --amount 1 --network tron:3448148188 \
+  --password-stdin --timeout 120000 -o json
 ```
 
-Or decouple: capture `data.txId`, then poll [`tx status`](../commands/tx/status.md) until `data.state` is `confirmed` (abort on `failed`). The full four-state polling pattern, including the batch-operation rules, is in [machine-interface.md → Script safety](../machine-interface.md#script-safety-never-mistake-submitted-for-confirmed).
+Or decouple: pass `--no-wait`, capture `data.txId`, then poll [`tx status`](../commands/tx/status.md) until `data.state` is `confirmed` (abort on `failed`). The full four-state polling pattern, including the batch-operation rules, is in [machine-interface.md → Script safety](../machine-interface.md#script-safety-never-mistake-submitted-for-confirmed).
 
 ## Sign here, broadcast there
 
-`--sign-only` and `tx broadcast` split signing from submission, so the machine holding keys never needs chain access:
+`--sign-only` separates signing from broadcast, but it still builds and estimates through the selected RPC endpoint before signing. For a signing machine with no chain access, build the unsigned hex online, sign that artifact offline, then broadcast from an online machine:
 
 ```bash
-# on the signing machine
-wallet-cli tx send --to T... --amount 1 --network tron:nile \
-  --password-stdin --sign-only -o json | jq -c '.data.signed' > signed.json
-
-# on the connected machine
-wallet-cli tx broadcast --tx-stdin --network tron:nile -o json < signed.json
+# on the connected build machine
+wallet-cli tx send --to T... --amount 1 --network tron:3448148188 \
+  --build-only --expiration 3600000 -o json | jq -r '.data.hex' > unsigned.hex
 ```
+
+```bash
+# on the offline signing machine
+printf '%s' "$PW" | wallet-cli tx sign --file unsigned.hex --network tron:3448148188 \
+  --offline --password-stdin --out signed.hex
+```
+
+```bash
+# on the connected machine
+wallet-cli tx broadcast --file signed.hex --network tron:3448148188 -o json
+```
+
+The **hex** form above works on both chain families — protobuf on TRON, RLP on EVM. `--expiration` is TRON-only; the value above gives the artifact one hour for transfer and signing (maximum 24 h). The node default is about 60 seconds, and `tx sign --offline` refuses an expired artifact, so pick the shortest practical window and rebuild after it lapses. Omit the flag on EVM, whose transaction format has no expiration field. If the signing machine does have RPC access and you only want to withhold broadcast, `tx send --sign-only` emits signed hex directly.
+
+TRON also accepts signed transaction JSON, but JSON must go through `--transaction` or `--tx-stdin`; `--file` and `--hex` are hex-only:
+
+```bash
+wallet-cli tx send ... --sign-only -o json | jq -c '.data.signed' > signed.json
+```
+
+```bash
+wallet-cli tx broadcast --tx-stdin --network tron:3448148188 -o json < signed.json
+```
+
+`--transaction` and `--tx-stdin` are tagged `(TRON only)`; on an EVM network they fail with `invalid_option`. Prefer `--file` / `--hex` in scripts that may target either.
 
 ## Timeouts and retries
 
-Every RPC/device call is bounded by `--timeout` (ms). On `error.code = "timeout"`, retrying with a larger value is safe for **read** commands; for `tx send`, first check `tx status` on the txid you may already have submitted — blind resend is how double-spends happen.
+`--timeout` (ms, default 90000) is one deadline for the whole command, including the wait for confirmation; `0` removes it. On `error.code = "timeout"`, retrying with a larger value is safe for **read** commands. For a write, look for `error.details.outcome` first: when it is `"unknown"` the write may have taken effect, so reconcile before resending: check `tx status` with `error.details.txId` when it is present, otherwise the command's own evidence (the GasFree `nonce` or `traceId`, `candidateTxHash`, the B.AI order, `sunpump token-search`) — blind resend is how double-spends happen. See [time limit](../machine-interface.md#time-limit---timeout).
 
 ## See also
 
 - [Machine interface](../machine-interface.md) — envelope schema, error codes, stability promise
+- [Command reference](../commands/index.md#which-commands-run-on-which-networks) — which commands run on which networks
 - [Command reference](../commands/index.md) — each command's `data` payload

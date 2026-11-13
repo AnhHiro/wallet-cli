@@ -12,21 +12,25 @@ wallet-cli token remove (--contract <address> | --asset-id <id>) [options]
 
 Removes a token you added from the user layer of the address book (same network + account scope as [`token add`](add.md)). Official-layer tokens cannot be removed — trying returns `token_is_official`.
 
+EVM contract addresses are compared without case sensitivity.
+
 Purely local — the token and your balance on-chain are unaffected; only the local symbol mapping goes away.
 
 ## Options
 
 | Option | Description |
 |---|---|
-| `--contract <string>` | TRC20 contract address to remove; exactly one of `--contract` / `--asset-id` |
-| `--asset-id <string>` | TRC10 numeric asset id to remove; exactly one of `--asset-id` / `--contract` |
+| `--contract <string>` | Token contract address to remove — TRC20 on TRON, ERC20 on EVM; exactly one of `--contract` / `--asset-id` |
+| `--asset-id <string>` | **TRON only.** TRC10 numeric asset id to remove; exactly one of `--asset-id` / `--contract` |
+
+`--asset-id` is a TRON-only flag: help tags it `(TRON only)`, and passing it on an EVM network fails with `invalid_option` before any node call.
 
 Plus the [global options](../index.md#global-options-every-command).
 
 ## Examples
 
 ```bash
-wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network tron:nile
+wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network nile
 ```
 
 ```console
@@ -36,11 +40,11 @@ wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network 
 ```
 
 ```bash
-wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network tron:nile -o json
+wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network nile -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"token.remove","data":{"network":"tron:nile","account":"wlt_b2.0","removed":{"kind":"trc20","id":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf","symbol":"USDT","decimals":6,"name":"Tether USD"}},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"token.remove","data":{"network":"tron:3448148188","account":"wlt_b2.0","removed":{"kind":"trc20","id":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf","symbol":"USDT","decimals":6,"name":"Tether USD"}},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 ## Output
@@ -49,11 +53,11 @@ wallet-cli token remove --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network 
 |---|---|---|
 | `network` | string | Network the entry was scoped to |
 | `account` | string | Account the entry was scoped to |
-| `removed` | object | The deleted token entry (`kind`, `id`, `symbol`, `decimals`, `name`) |
+| `removed` | object | The deleted token entry (`kind` — `trc20`/`trc10`/`erc20` — plus `id`, `symbol`, `decimals`, `name`) |
 
 ## Exit status
 
-`0` removed · `1` execution failure (`token_is_official` — official-layer tokens can't be removed; `token_not_in_book` — not in the book) · `2` usage error (`invalid_value`).
+`0` removed · `1` execution failure (`encoding_error` / `io_error` — the local token book could not be decoded or written) · `2` usage error (`token_is_official` — official-layer tokens can't be removed; `token_not_in_book` — not in the user layer; `invalid_value`; `invalid_option` — missing or conflicting selectors on TRON, or `--asset-id` on an EVM network; `missing_option` — a missing `--contract` on EVM).
 
 ## See also
 

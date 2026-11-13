@@ -17,12 +17,12 @@ export function expirationOf(transaction: TronTransactionArtifact): number {
   return expiration!;
 }
 
-export function assertNotExpired(transaction: TronTransactionArtifact, now = Date.now()): void {
+export function assertNotExpired(transaction: TronTransactionArtifact, now: number): void {
   const expiration = expirationOf(transaction);
   if (expiration <= now) {
     throw new ChainError(
       "tx_expired",
-      `transaction expired at ${new Date(expiration).toISOString()}`,
+      `transaction expired at ${new Date(expiration).toISOString()}; rebuild and sign it again`,
     );
   }
 }

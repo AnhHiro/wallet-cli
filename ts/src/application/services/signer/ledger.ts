@@ -1,8 +1,3 @@
-/**
- * LedgerSigner — device-backed signing through the LedgerDevice port.
- * Lives next to SoftwareSigner so all Signer implementations share one home; the device protocol
- * detail stays inside the injected `Ledger` (path/hex encoding, @ledgerhq, hw-app-trx).
- */
 import type { ChainFamily } from "../../../domain/family/index.js";
 import type {
   SignedTx,
@@ -24,11 +19,14 @@ export class LedgerSigner implements Signer {
     public readonly address: string,
   ) {}
 
-  async precheck(): Promise<void> {
-    const cfg = await this.ledger.appConfig(this.family); // throws auth_required if not ready
+  async precheck(signal: AbortSignal): Promise<void> {
+    const cfg = await this.ledger.appConfig(this.family, signal);
     if (!cfg.ready) throw new ExecutionError("auth_required", "open the correct app on the Ledger");
-    // the device's current seed/passphrase must still derive this account's cached address.
-    const onDevice = await this.ledger.getAddress(this.family, this.path, { display: false });
+    // The device seed/passphrase must still derive the cached address.
+    const onDevice = await this.ledger.getAddress(this.family, this.path, {
+      display: false,
+      signal,
+    });
     if (onDevice !== this.address) {
       throw new WalletError(
         "wrong_device_seed",
@@ -37,7 +35,9 @@ export class LedgerSigner implements Signer {
     }
   }
   async sign(tx: UnsignedTx, opts: SignerSignOpts): Promise<SignedTx> {
-    return this.ledger.signTransaction(this.family, this.path, tx, opts.signal);
+    return this.ledger.signTransaction(this.family, this.path, tx, opts.signal, {
+      onWarning: opts.onWarning,
+    });
   }
   async signMessage(message: string, opts: SignerSignOpts): Promise<string> {
     return this.ledger.signMessage(this.family, this.path, message, opts.signal);

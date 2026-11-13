@@ -21,10 +21,10 @@ function capture(output: "text" | "json") {
 
 const cmd = { path: ["account", "balance"] } as unknown as CommandDefinition;
 const net: NetworkDescriptor = {
-  id: "tron:nile",
+  id: "tron:3448148188",
   family: "tron",
+  nativeSymbol: "TRX",
   chainId: "nile",
-  aliases: ["nile"],
   capabilities: [],
 };
 
@@ -35,7 +35,7 @@ describe("createOutputFormatter (json)", () => {
     const env = JSON.parse(f.success(commandId(cmd), net, { balance: "1" }));
     expect(env.success).toBe(true);
     expect(env.command).toBe("account.balance");
-    expect(env.chain).toMatchObject({ network: "tron:nile", chainId: "nile" });
+    expect(env.chain).toMatchObject({ network: "tron:3448148188", chainId: "nile" });
     expect(env.data).toEqual({ balance: "1" });
     expect(env.meta).toMatchObject({ warnings: [] });
   });
@@ -71,9 +71,6 @@ describe("createOutputFormatter (json)", () => {
     expect(env.meta.pagination).toEqual({ offset: 10, limit: 5, total: 42 });
   });
 
-  // The commands whose endpoint reports no count (asset list / exchange list) must land in the SAME
-  // place as those that do — otherwise one envelope carries one concept in two locations, decided by
-  // whether a total happens to be knowable.
   it("moves pagination into metadata even when no total is knowable, as total: null", () => {
     const { sm } = capture("json");
     const f = createOutputFormatter("json", sm, 0);
@@ -115,7 +112,6 @@ describe("createOutputFormatter (json)", () => {
     expect(env.meta).not.toHaveProperty("pagination");
   });
 
-  // Text mode titles read the window from the view model, so it must NOT be stripped there.
   it("leaves pagination in the view model for text renderers", () => {
     const { sm } = capture("text");
     const f = createOutputFormatter("text", sm, 0);
@@ -131,7 +127,7 @@ describe("createOutputFormatter (json)", () => {
 describe("createOutputFormatter (text)", () => {
   it("generic output identifies the network by canonical id", () => {
     const text = renderGenericText("tron.test", net, {});
-    expect(text).toContain("network: tron:nile");
+    expect(text).toContain("network: tron:3448148188");
     expect(text).not.toContain("network: nile");
   });
 
@@ -156,7 +152,7 @@ describe("createOutputFormatter (text)", () => {
     const f = createOutputFormatter("text", sm, 0);
     const frame = f.event({ type: "awaiting_device", reason: "sign" });
     expect(frame).not.toBeNull();
-    expect(frame).not.toContain("{"); // human text, not NDJSON
+    expect(frame).not.toContain("{");
   });
 
   it("renders wallet create as a focused human receipt", () => {
@@ -208,28 +204,28 @@ describe("createOutputFormatter (text)", () => {
       },
       walletCmd.formatText,
     );
-    // icon and label live in separate ANSI spans, so assert on the pieces (not a fused substring).
+    // Icon and label occupy separate ANSI spans.
     expect(text).toContain("⚠");
     expect(text).toContain("Existing wallet");
-    expect(text).not.toContain("✅"); // existing wallets must not show the success check
+    expect(text).not.toContain("✅");
   });
 
   it("strips terminal control sequences from rendered data values", () => {
     const { sm } = capture("text");
     const f = createOutputFormatter("text", sm, 0);
-    // a hostile label / remote metadata value carrying ANSI CSI, OSC, and a bare C1 CSI byte.
+    // Include ANSI CSI, OSC, and a bare C1 CSI byte.
     const text = f.success(commandId(cmd), net, { balance: "1\x1b[31mHACKED\x1b]0;pwn\x07\x9bK" });
     expect(text).not.toContain("\x1b");
     expect(text).not.toContain("\x9b");
     expect(text).not.toContain("\x07");
-    expect(text).toContain("1"); // the real value survives, only control bytes are removed
+    expect(text).toContain("1");
   });
 
   it("preserves newlines while stripping control bytes", () => {
     const { sm } = capture("text");
     const f = createOutputFormatter("text", sm, 0);
     const text = f.success(commandId(cmd), net, { balance: "1" });
-    expect(text).toContain("\n"); // layout line breaks must remain intact
+    expect(text).toContain("\n");
   });
 
   it("sanitizes human error and event lines", () => {
@@ -247,7 +243,7 @@ describe("createOutputFormatter (text)", () => {
     const { sm } = capture("json");
     const f = createOutputFormatter("json", sm, 0);
     const env = JSON.parse(f.success(commandId(cmd), net, { balance: "1\x1b[31m" }));
-    expect(env.data.balance).toBe("1\x1b[31m"); // machine-parseable output stays byte-exact
+    expect(env.data.balance).toBe("1\x1b[31m");
   });
 
   it("renders backup metadata without secret material", () => {
@@ -277,9 +273,6 @@ describe("createOutputFormatter (text)", () => {
   });
 });
 
-// Chain-controlled strings (permission names, token metadata, TronLink signer labels) reach the
-// security summaries a user reads before approving. Bidi controls are not control BYTES, so the
-// C0/C1 strip lets them through — and U+202E reorders everything printed after it.
 describe("invisible formatting in untrusted display fields", () => {
   const RLO = String.fromCharCode(0x202e);
   const LRI = String.fromCharCode(0x2066);
@@ -306,7 +299,6 @@ describe("invisible formatting in untrusted display fields", () => {
   it("leaves ordinary right-to-left text alone", () => {
     const { sm } = capture("text");
     const f = createOutputFormatter("text", sm, 0);
-    // implicit bidi comes from the characters' own properties — nothing to neutralize
     const text = f.success(commandId(cmd), net, { label: "Acme \u0645\u0631\u062d\u0628\u0627" });
     expect(text).toContain("Acme \u0645\u0631\u062d\u0628\u0627");
     expect(text).not.toContain("<U+");
@@ -331,4 +323,31 @@ describe("invisible formatting in untrusted display fields", () => {
     });
     expect(frame).toContain("<U+202E>");
   });
+});
+
+it("renders activity as human progress in text and structured events in JSON", () => {
+  const event = { type: "activity" as const, message: "Checking payment requirements…" };
+  const human = createOutputFormatter("text", capture("text").sm, 0).event(event);
+  expect(human).toBe("⏳ Checking payment requirements…");
+  expect(JSON.parse(createOutputFormatter("json", capture("json").sm, 0).event(event)!)).toEqual(
+    event,
+  );
+});
+
+it.each(["next-page", "", null])("preserves B.AI cursor pagination (%s)", (nextCursor) => {
+  const formatter = createOutputFormatter("json", capture("json").sm, 0);
+  const result = JSON.parse(
+    formatter.success("bai.usage-records", undefined, {
+      records: [],
+      pagination: { offset: 0, limit: 3, hasMore: false, nextCursor },
+    }),
+  );
+  expect(result.meta.pagination).toEqual({
+    offset: 0,
+    limit: 3,
+    total: null,
+    hasMore: false,
+    nextCursor,
+  });
+  expect(result.data).toEqual({ records: [] });
 });

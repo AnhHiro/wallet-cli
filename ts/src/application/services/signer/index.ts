@@ -1,42 +1,38 @@
-/**
- * SignerResolver — turn an AccountRef + family into a Signer carrying its cached
- * address. The wallet's source type decides software vs ledger — this is where "the active
- * wallet decides whether hardware confirmation is needed" lands.
- */
 import type { ChainFamily, Signer, SignStrategy } from "../../../domain/types/index.js";
 import type { AccountStore } from "../../ports/account-store.js";
 import type { LedgerDevice } from "../../ports/ledger-device.js";
 import { walletAddress } from "../../../domain/wallet/index.js";
 import { LedgerSigner } from "./ledger.js";
 import { SoftwareSigner } from "./software.js";
-import { Derivation } from "../../../domain/derivation/index.js";
-import { WalletError } from "../../../domain/errors/index.js";
+import {
+  derivationMismatchError,
+  legacyDerivationError,
+  resolveDerivation,
+} from "../../../domain/wallet/derivation-match.js";
+import { UsageError, WalletError } from "../../../domain/errors/index.js";
+import { FAMILIES } from "../../../domain/family/index.js";
 
 export class SignerResolver {
   constructor(
-    private readonly keystore: Pick<AccountStore, "resolveAccount" | "decryptSeed" | "decryptKey">,
+    private readonly keystore: Pick<
+      AccountStore,
+      "resolveAccount" | "describe" | "decryptSeed" | "decryptKey"
+    >,
     private readonly ledger: LedgerDevice,
     private readonly signStrategies: Record<ChainFamily, SignStrategy>,
   ) {}
 
-  /**
-   * Cheap pre-flight capability gate: throws before any RPC or keystore decrypt when the active
-   * account cannot produce a signature (watch-only). Write commands call this FIRST so a
-   * "can't sign" failure wins over business-rule errors (e.g. insufficient voting power) — and so
-   * even --dry-run refuses a watch-only account rather than simulating a tx it could never send.
-   *
-   * `requireSoftware` additionally rejects Ledger accounts before any device interaction, for tx
-   * types the Ledger TRON app firmware cannot sign (e.g. contract deploy, cancel-all-unfreeze).
-   */
+  // Checks public metadata only; transaction callers gate this on transactionRequiresSigner.
   assertCanSign(
     refOrLabel: string,
     family: ChainFamily,
     opts?: { requireSoftware?: boolean },
   ): void {
-    const { wallet, index } = this.keystore.resolveAccount(refOrLabel);
+    const { wallet, index } = this.keystore.resolveAccount(refOrLabel, family);
     const address = walletAddress(wallet, family, index);
-    if (!address)
-      throw new WalletError("missing_wallet_address", `account has no ${family} address`);
+    if (!address) {
+      throw new UsageError("family_mismatch", `account has no ${family} address`);
+    }
     if (wallet.source.type === "watch") {
       throw new WalletError(
         "watch_only_no_signer",
@@ -46,16 +42,24 @@ export class SignerResolver {
     if (opts?.requireSoftware && wallet.source.type === "ledger") {
       throw new WalletError(
         "ledger_unsupported",
-        "this transaction type cannot be signed by the Ledger TRON app; use a software account",
+        `this transaction type cannot be signed by the Ledger ${FAMILIES[family].ledger?.app ?? family} app; use a software account`,
       );
     }
   }
 
+  /** Preflight credentials before creating an external payment order. */
+  prepare(refOrLabel: string, family: ChainFamily): void {
+    this.assertCanSign(refOrLabel, family);
+    const signer = this.resolve(refOrLabel, family);
+    if (signer instanceof SoftwareSigner) signer.prepare();
+  }
+
   resolve(refOrLabel: string, family: ChainFamily): Signer {
-    const { wallet, index } = this.keystore.resolveAccount(refOrLabel);
+    const { wallet, index } = this.keystore.resolveAccount(refOrLabel, family);
     const address = walletAddress(wallet, family, index);
-    if (!address)
-      throw new WalletError("missing_wallet_address", `account has no ${family} address`);
+    if (!address) {
+      throw new UsageError("family_mismatch", `account has no ${family} address`);
+    }
 
     switch (wallet.source.type) {
       case "privateKey": {
@@ -68,9 +72,17 @@ export class SignerResolver {
       }
       case "seed": {
         const { vaultId } = wallet.source;
-        const loadKey = () =>
-          Derivation.derive(this.keystore.decryptSeed(vaultId), Derivation.path(family, index))
-            .privateKey;
+        const ref = `${wallet.id}.${index}`;
+        const label = this.keystore.describe(ref).label;
+        const loadKey = () => {
+          // Defer seed decryption and derivation checks until key access is required.
+          const seed = this.keystore.decryptSeed(vaultId);
+          const resolved = resolveDerivation(seed, family, index, address);
+          if (!resolved) throw derivationMismatchError(family, ref);
+          if (resolved.scheme === "legacy")
+            throw legacyDerivationError(ref, resolved.path, "sign", { account: label });
+          return resolved.keyPair.privateKey;
+        };
         return new SoftwareSigner(loadKey, address, this.signStrategies[family]);
       }
       case "ledger":

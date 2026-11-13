@@ -1,28 +1,72 @@
+import type { ExecutionDeadline } from "../contracts/deadline.js";
 import { bytesToHex } from "@noble/hashes/utils.js";
 import { Derivation } from "../../domain/derivation/index.js";
-import { CHAIN_FAMILIES, familyOf, type ChainFamily } from "../../domain/family/index.js";
+import {
+  derivationMismatchError,
+  LEGACY_DERIVATION_RECOVERY_GUIDE,
+  legacyAccounts,
+  resolveDerivation,
+} from "../../domain/wallet/derivation-match.js";
+import { walletAddress } from "../../domain/wallet/index.js";
+import { assertPasswordPolicy } from "../../domain/wallet/password-policy.js";
+import {
+  addressCodec,
+  CHAIN_FAMILIES,
+  canonicalAddress,
+  familyOf,
+  tronHexAddress,
+  type ChainFamily,
+} from "../../domain/family/index.js";
+import { resembledFamily } from "../../domain/contact/index.js";
 import { KeystoreV3 } from "../../domain/keystore/index.js";
-import { derivePrivAddresses } from "../../domain/wallet/index.js";
-import { tronHexAddress } from "../../domain/address/index.js";
-import type { Bytes } from "../../domain/types/index.js";
-import { ExecutionError, UsageError, WalletError } from "../../domain/errors/index.js";
+import type {
+  AccountDescriptor,
+  AccountSelector,
+  Bytes,
+  WarningView,
+} from "../../domain/types/index.js";
+import {
+  errorMessage,
+  ExecutionError,
+  followUp,
+  inputRef,
+  UsageError,
+  WalletError,
+  type UserMessage,
+} from "../../domain/errors/index.js";
 import type { BackupWriter } from "../ports/backup-writer.js";
 import type { BackupRecord, BackupRecordStore } from "../ports/backup-records.js";
 import type { LedgerDevice } from "../ports/ledger-device.js";
+import type { PromptPort } from "../ports/prompt.js";
 import type { WalletRepository } from "../ports/wallet-repository.js";
+import { AccountSelection } from "../services/account-selection.js";
+import {
+  resolveLedgerPath,
+  selectLedgerPath,
+  type LedgerLocator,
+} from "../services/ledger-account.js";
 
 const mutationStatus = (created: boolean): "created" | "existing" =>
   created ? "created" : "existing";
 
+// Cached addresses cannot establish derivation paths without decrypting the seed.
+const withoutDerivationPath = <T extends AccountDescriptor>(
+  descriptor: T,
+): Omit<T, "derivationPath"> & { derivationPath: null } => ({
+  ...descriptor,
+  derivationPath: null,
+});
+
 const notExportable = (type: string) =>
   new WalletError("not_exportable", `${type} accounts hold no exportable secret`);
 
-/** A keystore file is single-key and TRON-shaped: its `address` is the TRON form, and an HD account
- *  exports the key at its own TRON derivation path. (EVM lands as its own export when it lands.) */
-const KEYSTORE_FAMILY: ChainFamily = "tron";
+// Preferred record identity for native backups covering every family.
+const RECORD_IDENTITY_FAMILY: ChainFamily = "tron";
+
+export const SECRET_FILE_NOT_REMOVED_WARNING = "secret_file_not_removed";
 
 export interface BackupRecordQuery {
-  /** inclusive bounds as UTC ISO-8601 instants; parsed and validated by the caller. */
+  // Inclusive UTC ISO-8601 bounds; caller parses and validates both.
   from?: string;
   to?: string;
   limit?: number;
@@ -31,14 +75,36 @@ export interface BackupRecordQuery {
   account?: string;
 }
 
+export interface DeriveRequest {
+  /** Explicit seed selection takes precedence over account and active-account selection. */
+  seedId?: string;
+  /** Any account belonging to an HD wallet identifies that wallet. */
+  account?: string;
+  index?: number;
+  label?: string;
+}
+
 export class WalletService {
+  readonly #selection: AccountSelection;
+
   constructor(
     private readonly wallets: WalletRepository,
     private readonly ledger: LedgerDevice,
     private readonly backups: BackupWriter,
     private readonly backupRecordStore: BackupRecordStore,
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    this.#selection = new AccountSelection(wallets);
+  }
+
+  // The account a command acts on: the requested one, else the active one.
+  selectAccount(requested?: string): AccountSelector {
+    return this.#selection.select(requested);
+  }
+
+  accountAddress(account: AccountSelector, family: ChainFamily): string {
+    return this.#selection.address(account, family);
+  }
 
   create(label?: string) {
     const mnemonic = Derivation.generateMnemonic(128);
@@ -53,100 +119,189 @@ export class WalletService {
     return this.importSecret(secret, "privateKey", label);
   }
 
-  async importLedger(family: ChainFamily, path: string, label?: string) {
-    const address = await this.ledger.getAddress(family, path, { display: false });
+  ledgerPath(deadline: ExecutionDeadline, family: ChainFamily, locator: LedgerLocator) {
+    return resolveLedgerPath(deadline, this.ledger, family, locator);
+  }
+
+  selectLedgerPath(
+    deadline: ExecutionDeadline,
+    family: ChainFamily,
+    prompt: PromptPort,
+    label: string,
+  ) {
+    return selectLedgerPath(deadline, this.ledger, family, prompt, label);
+  }
+
+  async importLedger(
+    deadline: ExecutionDeadline,
+    family: ChainFamily,
+    path: string,
+    label?: string,
+  ) {
+    const address = await this.ledger.getAddress(family, path, {
+      display: false,
+      signal: deadline.signal,
+    });
     const result = this.wallets.registerLedger({ family, path, address, label });
     return { status: mutationStatus(result.created), ...this.wallets.describe(result.accountId) };
   }
 
   importWatch(addressInput: string, label?: string) {
-    const address = addressInput.trim();
-    const family = familyOf(address);
-    if (!family) throw new UsageError("invalid_value", `unrecognised address format: ${address}`);
+    const input = addressInput.trim();
+    const family = familyOf(input);
+    if (!family) {
+      throw new UsageError("invalid_address", addressRejection(input));
+    }
+    const address = canonicalAddress(input);
     const result = this.wallets.registerWatch({ family, address, label });
     return { status: mutationStatus(result.created), ...this.wallets.describe(result.accountId) };
   }
 
   list() {
-    return this.wallets.list();
+    return this.wallets.list().map(withoutDerivationPath);
+  }
+
+  // Seed accounts share one keystore per wallet, so count wallets, not accounts.
+  softwareWalletCount(): number {
+    const walletIds = new Set(
+      this.wallets
+        .list()
+        .filter((a) => a.type === "seed" || a.type === "privateKey")
+        .map((a) => a.accountId.split(".")[0]),
+    );
+    return walletIds.size;
+  }
+
+  unreadableWallets() {
+    return this.wallets.unreadable();
   }
 
   use(account: string) {
     const result = this.wallets.setActive(account);
-    return { previous: result.previous, ...this.wallets.describe(result.accountId) };
+    return withoutDerivationPath({
+      previous: result.previous,
+      ...this.wallets.describe(result.accountId),
+    });
   }
 
   current(requestedAccount?: string) {
-    const account = requestedAccount ?? this.wallets.activeAccount();
-    if (!account)
-      throw new WalletError("missing_wallet_address", "no active account; import one first");
-    return this.wallets.describe(account);
+    const account = this.#selection.select(
+      requestedAccount,
+      errorMessage`no active account; import one first`,
+    );
+    return withoutDerivationPath(this.wallets.describe(account));
   }
 
   rename(account: string, label: string) {
     const result = this.wallets.rename(account, label);
-    return { previousLabel: result.previousLabel, ...this.wallets.describe(result.accountId) };
+    return withoutDerivationPath({
+      previousLabel: result.previousLabel,
+      ...this.wallets.describe(result.accountId),
+    });
   }
 
   changePassword(oldPassword: string, newPassword: string) {
+    assertPasswordPolicy(newPassword);
     return this.wallets.changePassword(oldPassword, newPassword);
   }
 
-  derive(seedId: string, index?: number, label?: string) {
-    // --seed-id is strictly the seed id (wlt_…) — the HD group header in `list`. No labels, no
-    // sub-account refs: labels/refs point at an account, and the seed (not an account) is the root.
-    const id = seedId.trim();
-    if (!/^wlt_[^.]+$/.test(id)) {
-      throw new UsageError(
-        "invalid_value",
-        `--seed-id takes a seed id (wlt_…), not '${seedId}'; copy it from the HD group header in \`list\``,
+  derive(request: DeriveRequest, warn?: (message: string) => void) {
+    const wallet = (() => {
+      // Explicit seed selection must work even if the account override is stale.
+      if (request.seedId !== undefined) {
+        const id = request.seedId.trim();
+        if (!/^wlt_[^.]+$/.test(id)) {
+          throw new UsageError(
+            "invalid_value",
+            errorMessage`${inputRef("seedId")} takes a seed id (wlt_…), not '${request.seedId}'; copy it from the HD group header in \`${followUp("account-list")}\``,
+          );
+        }
+        return this.wallets.resolveWallet(id);
+      }
+
+      const account = this.#selection.select(
+        request.account,
+        errorMessage`no active account; select an HD account with ${inputRef("account")} or pass ${inputRef("seedId")}`,
       );
-    }
-    const wallet = this.wallets.resolveWallet(id);
+      return this.wallets.resolveAccount(account).wallet;
+    })();
+
     if (wallet.source.type !== "seed") {
       throw new UsageError(
-        "invalid_value",
-        `${wallet.source.type} wallet is not HD; derive needs a seed wallet`,
+        "seed_not_found",
+        request.seedId !== undefined
+          ? errorMessage`${wallet.source.type} wallet is not HD; ${inputRef("seedId")} must name an HD seed wallet`
+          : errorMessage`${wallet.source.type} account is not HD; select an account belonging to an HD wallet or pass ${inputRef("seedId")} <wlt_…>`,
       );
     }
-    const baseLabel = this.wallets.describe(`${wallet.id}.0`).label; // the wallet's name (index-0 label)
-    const result = this.wallets.addAccount(wallet.id, index);
-    if (label) {
-      this.wallets.rename(result.accountId, label);
-    } else if (result.created) {
-      // auto-name new accounts <wallet-name>-<index> so they read as siblings under the same seed.
-      const newIndex = Number(result.accountId.split(".")[1]);
-      this.wallets.rename(result.accountId, `${baseLabel ?? "hd"}-${newIndex}`);
+    const result = this.wallets.addAccount(wallet.id, request.index, request.label);
+    const descriptor = this.#describeWithVerifiedDerivation(result.accountId);
+    const tronPath = descriptor.derivationPath?.tron;
+    if (
+      !result.created &&
+      descriptor.index !== null &&
+      tronPath !== undefined &&
+      Derivation.legacyPaths("tron", descriptor.index).includes(tronPath)
+    ) {
+      warn?.(
+        `existing account ${JSON.stringify(descriptor.label ?? descriptor.accountId)} uses legacy TRON path ${tronPath}. ` +
+          `The wallet's recovery phrase can still derive this key at that path, but this version's default mnemonic recovery will not recreate its TRON address. ` +
+          `Follow ${LEGACY_DERIVATION_RECOVERY_GUIDE}`,
+      );
     }
-    return { status: mutationStatus(result.created), ...this.wallets.describe(result.accountId) };
+    return {
+      status: mutationStatus(result.created),
+      ...descriptor,
+    };
   }
 
   describe(account: string) {
     return this.wallets.describe(account);
   }
 
-  delete(account: string) {
-    // `scope` ("account" | "wallet") tells the caller/renderer whether a single HD sub-account or
-    // the whole wallet (incl. children + secret) was removed — a root ref cascades to "wallet".
-    return this.wallets.delete(account);
+  // Without decrypting the seed, deletion cannot verify the cached addresses’ derivation paths.
+  deletionWarning(account: string): string | undefined {
+    const { wallet } = this.wallets.resolveAccount(account);
+    if (
+      wallet.source.type !== "seed" ||
+      !Object.entries(wallet.source.addresses).some(
+        ([index, addresses]) => Number(index) > 0 && addresses.tron,
+      )
+    )
+      return;
+    return (
+      "This HD wallet contains TRON sub-accounts. If created with an older derivation path, default mnemonic recovery may not recreate them. Back up and verify their keys before deleting. " +
+      LEGACY_DERIVATION_RECOVERY_GUIDE
+    );
+  }
+
+  delete(account: string, warn: (warning: WarningView) => void) {
+    const { retainedSecretFile, ...result } = this.wallets.delete(account);
+    if (retainedSecretFile !== undefined) {
+      warn({
+        code: SECRET_FILE_NOT_REMOVED_WARNING,
+        message: `the account was deleted, but its encrypted secret file could not be removed: ${retainedSecretFile}; delete that file yourself`,
+      });
+    }
+    return result;
   }
 
   verifyPassword(password: string) {
     return this.wallets.verifyPassword(password);
   }
 
-  /** Ledger / watch accounts hold no exportable secret. Callers check this BEFORE the master-password
-   *  gate: a Ledger-only keystore may have no password sentinel at all, and verifying against a
-   *  missing sentinel can never succeed — the user would face a prompt no answer satisfies. */
+  // Check before prompting: Ledger/watch accounts may have no master-password sentinel.
   assertExportable(account: string) {
     const { type } = this.wallets.resolveAccount(account).wallet.source;
     if (type !== "seed" && type !== "privateKey") throw notExportable(type);
   }
 
-  backup(account: string, requestedPath?: string) {
-    const descriptor = this.wallets.describe(account);
+  /** `warn` names accounts that this version's default mnemonic recovery will not rediscover. */
+  backup(account: string, requestedPath?: string, warn?: (message: UserMessage) => void) {
     const { wallet } = this.wallets.resolveAccount(account);
     const source = wallet.source;
+    const seed = source.type === "seed" ? this.wallets.decryptSeed(source.vaultId) : undefined;
+    const descriptor = this.#describeWithVerifiedDerivation(account, seed);
     const metadata = {
       accountId: descriptor.accountId,
       type: source.type,
@@ -161,6 +316,21 @@ export class WalletService {
       passphraseSet = revealed.passphraseSet;
       secretType = "mnemonic";
       payload = { ...metadata, secretType, passphraseSet, mnemonic: revealed.mnemonic };
+      // A mnemonic covers the whole seed; check every account’s recovery path.
+      const stranded = legacyAccounts(seed!, source.addresses);
+      if (stranded.length > 0 && warn) {
+        const one = stranded.length === 1;
+        const steps = stranded
+          .map((a) => errorMessage`  ${followUp("keystore-backup", `${wallet.id}.${a.index}`)}`)
+          .reduce((all, step) => errorMessage`${all}\n${step}`);
+        warn(
+          errorMessage`this version's default mnemonic recovery will NOT recreate ${stranded
+            .map((a) => `${wallet.id}.${a.index} (${a.path})`)
+            .join(
+              ", ",
+            )} — ${one ? "that account was" : "those accounts were"} derived at a TRON path this version no longer produces, but the recovery phrase can still derive ${one ? "that key" : "those keys"} at the listed ${one ? "path" : "paths"}. Export ${one ? "it" : "each"} separately before deleting anything:\n${steps}\nFollow ${LEGACY_DERIVATION_RECOVERY_GUIDE}`,
+        );
+      }
     } else if (source.type === "privateKey") {
       secretType = "privateKey";
       payload = {
@@ -173,77 +343,62 @@ export class WalletService {
     }
 
     const file = this.backups.write(descriptor.accountId, requestedPath, payload, "native");
-    this.#recordExport("backup", descriptor, file.out);
+    // Native backups cover every family, including raw private-key backups.
+    this.#recordExport("native-export", descriptor, file.out);
     return { ...descriptor, secretType, format: "native" as const, ...file };
   }
 
-  /**
-   * Export ONE account as a standard Web3 V3 keystore, encrypted with the master password.
-   *
-   * A keystore holds a single private key: an HD account exports only the key at its current index,
-   * so the file is an isolated account elsewhere and nothing can be derived from it. Moving a whole
-   * seed is what the native `backup` (mnemonic) is for.
-   */
-  backupKeystore(account: string, requestedPath: string | undefined, masterPassword: string) {
-    const descriptor = this.wallets.describe(account);
-    const privateKey = this.#exportablePrivateKey(account);
+  // Encrypts one account’s private key with the master password; does not export the seed.
+  // Family selects an HD key; private-key accounts share one key across families.
+  backupKeystore(
+    account: string,
+    requestedPath: string | undefined,
+    masterPassword: string,
+    family: ChainFamily,
+  ) {
+    const { wallet } = this.wallets.resolveAccount(account);
+    const seed =
+      wallet.source.type === "seed" ? this.wallets.decryptSeed(wallet.source.vaultId) : undefined;
+    const descriptor = this.#describeWithVerifiedDerivation(account, seed);
+    const privateKey = this.#exportablePrivateKey(account, family, seed);
     const file = this.backups.write(
       descriptor.accountId,
       requestedPath,
-      KeystoreV3.encrypt(
-        privateKey,
-        masterPassword,
-        tronHexAddress(descriptor.addresses[KEYSTORE_FAMILY]!),
-      ),
+      KeystoreV3.encrypt(privateKey, masterPassword, keystoreAddress(family, privateKey)),
       "keystore",
     );
-    this.#recordExport("backup --keystore", descriptor, file.out);
+    this.#recordExport("keystore-export", descriptor, file.out, family);
     return {
       ...descriptor,
+      family,
       secretType: "privateKey" as const,
       format: "keystore" as const,
       ...file,
     };
   }
 
-  /**
-   * Import the single private key held in a parsed V3 keystore, re-encrypted under the master
-   * password and made active.
-   *
-   * Deliberate deviation from the Java implementation, which silently overwrites a same-address
-   * wallet: a clash is refused, because that account may be an HD account whose seed backup the
-   * overwrite would destroy in exchange for one derived key. Delete it explicitly instead.
-   */
   importKeystore(file: unknown, keystorePassword: string, label?: string) {
     const privateKey = KeystoreV3.decrypt(file, keystorePassword);
-    const addresses = derivePrivAddresses(privateKey);
-    const clash = this.wallets
-      .list()
-      .find((a) =>
-        CHAIN_FAMILIES.some((f) => a.addresses[f] !== undefined && a.addresses[f] === addresses[f]),
-      );
-    if (clash) {
-      throw new WalletError(
-        "account_exists",
-        `${clash.accountId}${clash.label ? ` (${clash.label})` : ""} already holds this address; delete it first to replace it`,
-      );
-    }
+    // Reject invalid scalars before address derivation can throw an unclassified error.
+    if (!Derivation.isValidPrivateKey(privateKey))
+      throw new WalletError("invalid_private_key", "private key is out of range for secp256k1");
     return this.importSecret(bytesToHex(privateKey), "privateKey", label);
   }
 
-  /** The local export audit log, newest first. Read-only and password-free — it holds no secrets. */
+  // Password-free export metadata, newest first.
   backupRecords(query: BackupRecordQuery = {}) {
     const offset = query.offset ?? 0;
     const target = query.account === undefined ? undefined : this.wallets.describe(query.account);
     const matched = this.backupRecordStore.list().filter((r) => {
       if (query.from !== undefined && r.timestamp < query.from) return false;
       if (query.to !== undefined && r.timestamp > query.to) return false;
-      // Records are snapshots, so an account is matched by either identity it was logged under —
-      // a since-renamed account still matches on accountId, a re-imported one on its address.
+      // Match IDs after rename or any family’s address after reimport.
       if (
         target &&
         r.accountId !== target.accountId &&
-        r.account !== target.addresses[KEYSTORE_FAMILY]
+        !CHAIN_FAMILIES.some(
+          (f) => target.addresses[f] !== undefined && r.account === target.addresses[f],
+        )
       )
         return false;
       return true;
@@ -262,28 +417,41 @@ export class WalletService {
     return this.wallets.isInitialized();
   }
 
-  /** The account's own private key: an HD account's is derived at its index; a privateKey wallet's is
-   *  the stored key. Watch/Ledger accounts have none (assertExportable is the caller's early gate). */
-  #exportablePrivateKey(account: string): Bytes {
+  // Verify paths against cached addresses; never substitute an unverified derivation template.
+  #describeWithVerifiedDerivation(account: string, knownSeed?: Bytes): AccountDescriptor {
+    const descriptor = this.wallets.describe(account);
+    const { wallet, index } = this.wallets.resolveAccount(account);
+    if (wallet.source.type !== "seed") return descriptor;
+
+    const seed = knownSeed ?? this.wallets.decryptSeed(wallet.source.vaultId);
+    const derivationPath: Record<string, string> = {};
+    for (const family of CHAIN_FAMILIES) {
+      const address = walletAddress(wallet, family, index);
+      if (!address) continue;
+      const resolved = resolveDerivation(seed, family, index, address);
+      if (!resolved) throw derivationMismatchError(family, descriptor.accountId);
+      derivationPath[family] = resolved.path;
+    }
+    return { ...descriptor, derivationPath };
+  }
+
+  // Export the key matching the stored address, including a legacy derivation path.
+  #exportablePrivateKey(account: string, family: ChainFamily, knownSeed?: Bytes): Bytes {
     const { wallet, index } = this.wallets.resolveAccount(account);
     const source = wallet.source;
     if (source.type === "privateKey") return this.wallets.decryptKey(source.keyId);
     if (source.type === "seed") {
-      const seed = this.wallets.decryptSeed(source.vaultId);
-      return Derivation.derive(seed, Derivation.path(KEYSTORE_FAMILY, index)).privateKey;
+      const address = walletAddress(wallet, family, index);
+      if (!address) throw new UsageError("family_mismatch", `account has no ${family} address`);
+      const seed = knownSeed ?? this.wallets.decryptSeed(source.vaultId);
+      const resolved = resolveDerivation(seed, family, index, address);
+      if (!resolved) throw derivationMismatchError(family, account);
+      return resolved.keyPair.privateKey;
     }
     throw notExportable(source.type);
   }
 
-  /**
-   * Appended only after the file exists, so the audit log never claims a failed export.
-   * Timestamps are UTC at second precision — an audit trail, not a profiler.
-   *
-   * The secret is already on disk by the time this runs, so a failure here is not a clean one: the
-   * export did not fully succeed, but something sensitive exists that the caller must be able to
-   * find and shred. Without `--out` that is a timestamped file in the process's working directory,
-   * which nobody can guess — so the path travels with the error rather than being lost with it.
-   */
+  // Record only completed writes; if logging fails, retain the path to the exported secret.
   #recordExport(
     operation: BackupRecord["operation"],
     descriptor: {
@@ -292,13 +460,14 @@ export class WalletService {
       addresses: Partial<Record<ChainFamily, string>>;
     },
     out: string,
+    family?: ChainFamily,
   ) {
     try {
-      this.#appendExport(operation, descriptor, out);
+      this.#appendExport(operation, descriptor, out, family);
     } catch (error) {
       throw new ExecutionError(
         "audit_append_failed",
-        `the ${operation === "backup" ? "backup" : "keystore"} file was written to ${out}, but recording it in the export log failed: ${(error as Error).message}`,
+        `the ${operation === "native-export" ? "backup" : "keystore"} file was written to ${out}, but recording it in the export log failed: ${(error as Error).message}`,
         { out, fileMode: "0600" },
       );
     }
@@ -312,11 +481,19 @@ export class WalletService {
       addresses: Partial<Record<ChainFamily, string>>;
     },
     out: string,
+    family?: ChainFamily,
   ) {
+    // Record the exported family’s address; native backups use a representative wallet address.
+    const address =
+      (family === undefined ? undefined : descriptor.addresses[family]) ??
+      descriptor.addresses[RECORD_IDENTITY_FAMILY] ??
+      CHAIN_FAMILIES.map((f) => descriptor.addresses[f]).find((a) => a !== undefined) ??
+      "";
     this.backupRecordStore.append({
       operation,
       accountId: descriptor.accountId,
-      account: descriptor.addresses[KEYSTORE_FAMILY] ?? "",
+      account: address,
+      ...(family === undefined ? {} : { family }),
       label: descriptor.label ?? null,
       out,
       timestamp: new Date(this.now()).toISOString().replace(/\.\d{3}Z$/, "Z"),
@@ -327,4 +504,18 @@ export class WalletService {
     const result = this.wallets.import({ secret, type, label });
     return { status: mutationStatus(result.created), ...this.wallets.describe(result.accountId) };
   }
+}
+
+// Informational address: TRON uses 41-prefixed hex; EVM uses 0x-prefixed hex.
+function keystoreAddress(family: ChainFamily, privateKey: Bytes): string {
+  const publicKey = Derivation.publicKeyFromPrivate(privateKey);
+  const address = addressCodec(family).fromPublicKey(publicKey);
+  return family === "tron" ? tronHexAddress(address) : address;
+}
+
+function addressRejection(value: string): string {
+  const resembles = resembledFamily(value);
+  return resembles
+    ? `${value} looks like a ${resembles} address but its length or checksum is wrong`
+    : `unrecognised address format: ${value}`;
 }

@@ -35,44 +35,44 @@ Plus the [global options](../index.md#global-options-every-command).
 Outbound (default) — includes **Max delegatable**:
 
 ```bash
-wallet-cli stake delegated --direction out --account main --network tron:nile
+wallet-cli stake delegated --direction out --account main --network nile
 ```
 
 ```console
-Label        main
-Direction    out (delegated to others)
+Label      main
+Direction  out (delegated to others)
 
 Max delegatable
-  Energy       58,500  (≈ 900 TRX)
-  Bandwidth       900  (≈ 300 TRX)
+  Energy     900 TRX
+  Bandwidth  300 TRX
 
 Delegations (2)
   Receiver                            Resource   Amount   Locked until
-  TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub  energy     500 TRX  2026-07-08 08:00 (~3 days)
-  TXe4Kd8nP2rF9gH5jL3mV6cW1bN7yS0aQz  bandwidth  100 TRX  not locked
+  TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c  energy     500 TRX  2026-07-08 08:00 (in ~3 day(s))
+  TNDHPk1LMLZTap8tMWfxUBy4MgArnWeSVP  bandwidth  100 TRX  not locked
 ```
 
 ```bash
-wallet-cli stake delegated --direction out --account main --network tron:nile -o json
+wallet-cli stake delegated --direction out --account main --network nile -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"stake.delegated","data":{"address":"TQk...","direction":"out","canDelegateMaxSun":{"energy":"900000000","bandwidth":"300000000"},"delegations":[{"receiver":"TBy6...","resource":"energy","amountSun":"500000000","lockedUntil":1783468800000},{"receiver":"TXe4...","resource":"bandwidth","amountSun":"100000000","lockedUntil":null}]},"meta":{"durationMs":28,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"stake.delegated","data":{"address":"TP2Zs9qKScTMs8jDYV3SAHQ5pqgKY1NQ5V","direction":"out","canDelegateMaxSun":{"energy":"900000000","bandwidth":"300000000"},"delegations":[{"receiver":"TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c","resource":"energy","amountSun":"500000000","lockedUntil":1783468800000},{"receiver":"TNDHPk1LMLZTap8tMWfxUBy4MgArnWeSVP","resource":"bandwidth","amountSun":"100000000","lockedUntil":null}]},"meta":{"durationMs":28,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 Inbound (`--direction in`) — the lock column becomes `Guaranteed until`, no Max delegatable:
 
 ```bash
-wallet-cli stake delegated --direction in --account main --network tron:nile
+wallet-cli stake delegated --direction in --account main --network nile
 ```
 
 ```console
-Label        main
-Direction    in (delegated to me)
+Label      main
+Direction  in (delegated to me)
 
 Delegations (1)
   From                                Resource  Amount   Guaranteed until
-  TBy6mQ7Y3nJ8sD2fWpXk4LhVc9Ra1Zt5Ub  energy    500 TRX  2026-07-08 08:00 (~3 days)
+  TF9yB7bAL2oBbonYaMvGTqoXxExS14x73c  energy    500 TRX  2026-07-08 08:00 (in ~3 day(s))
 ```
 
 ## Output
@@ -81,7 +81,7 @@ Delegations (1)
 |---|---|---|
 | `address` | string | Queried account |
 | `direction` | string | `out` / `in` |
-| `canDelegateMaxSun` | object | `{energy, bandwidth}` SUN strings — max still delegatable (out only) |
+| `canDelegateMaxSun` | object | `{energy, bandwidth}` SUN strings — max still delegatable (out only); with `--resource`, only that resource's key |
 | `delegations[]` | array | Each: `receiver` (out) or `from` (in), `resource`, `amountSun` (string), `lockedUntil` (epoch ms or `null`) |
 
 ## Exit status

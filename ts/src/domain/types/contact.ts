@@ -1,6 +1,6 @@
 import type { ChainFamily } from "../family/chain-family.js";
 
-/** Canonical persisted recipient. nameKey is an integrity-checked lookup key. */
+// nameKey is the normalized lookup key.
 export interface ContactEntry {
   name: string;
   nameKey: string;
@@ -9,12 +9,10 @@ export interface ContactEntry {
   family: ChainFamily;
 }
 
-/** Public contact projection; storage-only normalization fields never leak. */
 export interface ContactView {
   name: string;
   address: string;
   note: string | null;
-  family: ChainFamily;
 }
 
 export interface ContactListView {

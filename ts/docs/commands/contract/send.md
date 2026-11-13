@@ -1,22 +1,28 @@
 # wallet-cli contract send
 
-State-changing contract call (triggerSmartContract).
+State-changing contract call.
 
 ## Synopsis
 
 ```
-wallet-cli contract send --contract <address> --method <sig> [--params <json>]
-                         [--call-value-sun <n>] [--fee-limit <sun>]
-                         [--dry-run | (--sign-only | --build-only) [--expiration <ms>] | --wait [--wait-timeout <ms>]] [--permission-id <n>] [options]
+wallet-cli contract send --contract <address> --method <sig> [--params <json>] [--value <n>]
+                         [--dry-run | --sign-only | --build-only | --wait | --no-wait]
+                         [--fee-limit <sun>] [--permission-id <n>] [--expiration <ms>]
+                         [--gas-limit <n>] [--max-fee <gwei>] [--priority-fee <gwei>] [--nonce <n>]
+                         [options]
 ```
 
 ## Description
 
-Builds, signs, and broadcasts a state-changing contract call from the active account (or `--account`). Parameters follow the same `{type,value}` JSON-array convention as [`contract call`](call.md); `--call-value-sun` attaches native TRX to the call.
+Builds, signs, and broadcasts a state-changing contract call from the active account (or `--account`), on TRON or EVM. Parameters follow the same `{type,value}` JSON-array convention as [`contract call`](call.md); the signature and types are supplied explicitly, no ABI is consulted.
 
-Two early exits: `--dry-run` previews the energy cost (estimateEnergy) without signing or broadcasting; `--sign-only` signs and prints the transaction for a later [`tx broadcast`](../tx/broadcast.md).
+`--value` attaches native coin to the call, in **whole coins** (`1.5`, not the base unit). TRON's `--call-value-sun` still works and takes SUN, but it is **deprecated and removed next release** — use `--value`.
 
-**By default the command returns at submission** (`stage: "submitted"`) — add `--wait` to block until confirmed/failed. With `--wait`, an on-chain execution failure (revert / `OUT_OF_ENERGY`) comes back as `stage: "failed"` with the `result` reason.
+Three early exits: `--dry-run` previews the cost without signing or broadcasting — energy on TRON, a gas ceiling on EVM; `--sign-only` signs and prints the transaction for a later [`tx broadcast`](../tx/broadcast.md); `--build-only` prints it unsigned.
+
+Fee flags follow the family — `--fee-limit` / `--permission-id` / `--expiration` on TRON, `--gas-limit` / `--max-fee` / `--priority-fee` / `--nonce` on EVM. Help tags each set, and using one on the other family is refused with `invalid_option`.
+
+**By default the command waits for confirmation** (`stage: "confirmed"` or `"failed"`); `--no-wait` returns at submission (`stage: "submitted"`). An on-chain execution failure comes back as `stage: "failed"` — with the `result` reason on TRON (revert / `OUT_OF_ENERGY`), and with the receipt's failed status on EVM.
 
 Requires an account. The master password (via `--password-stdin`) is needed only by the modes that sign — `--dry-run` and `--build-only` do not unlock the wallet and run without it. Watch-only accounts fail with `watch_only_no_signer` in a signing mode.
 
@@ -24,18 +30,34 @@ Requires an account. The master password (via `--password-stdin`) is needed only
 
 | Option | Description |
 |---|---|
-| `--contract <string>` | **Required.** Contract address |
+| `--contract <string>` | **Required.** Contract address — base58 on TRON, `0x` on EVM |
 | `--method <string>` | **Required.** Function signature, e.g. `transfer(address,uint256)` |
 | `--params <string>` | JSON array of ABI parameters as `{type,value}` |
-| `--call-value-sun <number>` | Native TRX attached to the call, in SUN (default 0) |
-| `--fee-limit <number>` | Max energy fee to burn, in SUN (default 100000000) |
-| `--dry-run` | Estimate energy only, no signature/broadcast; excludes `--sign-only` / `--build-only` |
-| `--sign-only` | Sign without broadcasting, output the signed hex; excludes `--dry-run` / `--build-only`; pairs with `--expiration` |
-| `--build-only` | Build only, output the **unsigned** hex; excludes `--dry-run` / `--sign-only`; pairs with `--expiration` |
-| `--expiration <ms>` | Transaction expiration in ms, up to `86400000` (24h); only with `--sign-only` or `--build-only`; omitted = node default (~60s) |
-| `--permission-id <n>` | Permission group to sign with (0=owner, 1=witness, 2-9=active); default `0` |
-| `--wait` / `--wait-timeout <ms>` | Poll after broadcast until confirmed/failed (cap default: config `waitTimeoutMs`, built-in 60000) |
+| `--value <string>` | Native coin sent with the call, in whole coins |
+| `--dry-run` | Estimate only, no signature/broadcast; excludes `--sign-only` / `--build-only` |
+| `--sign-only` | Sign without broadcasting, output the signed hex; excludes `--dry-run` / `--build-only` |
+| `--build-only` | Build and estimate, output the **unsigned** hex; excludes `--dry-run` / `--sign-only` |
+| `--wait` | Poll after broadcast until confirmed or failed, up to the command deadline (`--timeout`); at the deadline it returns the submitted receipt with a warning. This is the default |
+| `--no-wait` | Return the submitted receipt without polling for confirmation |
 | `--password-stdin` | Master password from stdin |
+
+TRON only:
+
+| Option | Description |
+|---|---|
+| `--call-value-sun <string>` | **Deprecated**, removed next release — native TRX attached to the call, in SUN. Use `--value` |
+| `--fee-limit <string>` | Max energy fee to burn, in SUN (default 100000000) |
+| `--permission-id <n>` | Permission group to sign with (0=owner, 1=witness, 2-9=active); default `0` |
+| `--expiration <ms>` | Transaction expiration in ms, up to `86400000` (24h); only with `--sign-only` or `--build-only`; omitted = node default (~60s; [Ledger exception](../../guide/ledger.md#3-when-the-device-doesnt-respond)) |
+
+EVM only:
+
+| Option | Description |
+|---|---|
+| `--gas-limit <string>` | Gas units to authorise; default is the node's estimate, unpadded |
+| `--max-fee <gwei>` | Maximum total fee per gas (EIP-1559 chains only) |
+| `--priority-fee <gwei>` | Tip per gas (EIP-1559 chains only) |
+| `--nonce <n>` | Transaction nonce; default is the account's pending nonce. Under `--dry-run` an explicit nonce is checked against the account's *mined* count and a spent one fails with `nonce_too_low` before any estimate; a nonce merely ahead of the next one stays a `meta.warnings` gap notice |
 
 Plus the [global options](../index.md#global-options-every-command).
 
@@ -43,31 +65,32 @@ Plus the [global options](../index.md#global-options-every-command).
 
 In the examples, `$PW` is your master password (from an environment variable, password manager, etc.), fed on stdin via `--password-stdin`.
 
-Default — broadcasts and returns the **submitted** receipt:
+With `--no-wait` — broadcasts and returns the **submitted** receipt:
 
 ```bash
-echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[{"type":"address","value":"TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc"},{"type":"uint256","value":"1000000"}]' --network tron:nile --password-stdin
+echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[{"type":"address","value":"TSx72ViULFepRGCS4PM5dP4FqD1d8qggCc"},{"type":"uint256","value":"1000000"}]' --network nile --no-wait --password-stdin
 ```
 
 ```console
 ⏳ Called transfer
-  TxID    c8d...
-  Status  pending — not yet on-chain
-! Track it: wallet-cli tx info --network tron:nile --txid c8d...
+  Contract  TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf
+  TxID      c8d...
+  Status    pending — not yet on-chain
+! Track it: wallet-cli tx info --network tron:3448148188 --txid c8d...
 ```
 
 ```bash
-echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network tron:nile --password-stdin -o json
+echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network nile --no-wait --password-stdin -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"contract.send","data":{"kind":"contract-send","stage":"submitted","txId":"c8d...","method":"transfer(address,uint256)","contract":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"contract.send","data":{"kind":"contract-send","stage":"submitted","txId":"c8d...","method":"transfer(address,uint256)","contract":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf"},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
-With `--wait`, blocks until confirmed — on success:
+Without `--no-wait`, the command blocks until confirmed — on success:
 
 ```bash
-echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network tron:nile --wait --password-stdin
+echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network nile --password-stdin
 ```
 
 ```console
@@ -83,16 +106,18 @@ echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkA
 An on-chain failure (e.g. out of energy) returns `stage: "failed"`:
 
 ```bash
-echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network tron:nile --wait --password-stdin
+echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --method "transfer(address,uint256)" --params '[...]' --network nile --password-stdin
 ```
 
 ```console
 ❌ Called transfer
-  TxID    c8d...
-  Block   #66,000,123
-  Energy  31,200
-  Status  failed
-  Reason  OUT_OF_ENERGY
+  Contract  TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf
+  TxID      c8d...
+  Block     #66,000,123
+  Energy    31,200
+  Fee       0 TRX
+  Status    failed
+  Reason    OUT_OF_ENERGY
 ```
 
 ## Output
@@ -101,16 +126,20 @@ echo "$PW" | wallet-cli contract send --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkA
 
 | Mode | Fields |
 |---|---|
-| default (submit) | `kind: "contract-send"`, `stage: "submitted"`, `txId`, `method`, `contract` |
-| `--wait` (confirmed/failed) | above, but `stage: "confirmed"` or `"failed"`, plus `confirmed`, `blockNumber`, `feeSun`, `energyUsed`, `result` (`SUCCESS` / `OUT_OF_ENERGY`, etc.), `failed` |
-| `--dry-run` | `kind`, `mode: "dry-run"`, `fee` (`feeModel`, estimated `energy`, `availableEnergy`), unsigned `tx` |
-| `--sign-only` | `kind`, `mode: "sign-only"`, `hex` (signed transaction hex), `signed` (the same transaction as a TRON tx object incl. `signature[]`), `address` (signer), `txId`, `fee`, `method`, `contract` |
-| `--build-only` | `kind`, `mode: "build-only"`, `hex` (**unsigned** transaction hex), unsigned `tx` (TRON tx object), `fee`, `method`, `contract` |
+| `--no-wait` (submitted) | `kind: "contract-send"`, `stage: "submitted"`, `txId`, `method`, `contract` |
+| default or `--wait` (confirmed/failed) | above, but `stage: "confirmed"` or `"failed"`, plus `confirmed`, `blockNumber`, `failed`, and the realised cost — `feeSun` / `energyUsed` / `result` (`SUCCESS`, `OUT_OF_ENERGY`, …) on TRON, `gasUsed` / `feeWei` / `effectiveGasPriceWei` on EVM |
+| `--dry-run` | `kind`, `mode: "dry-run"`, `fee`, unsigned `tx` |
+| `--sign-only` | `kind`, `mode: "sign-only"`, `hex` (signed transaction hex), `signed`, `address` (signer), `txId`, `fee`, `method`, `contract` |
+| `--build-only` | `kind`, `mode: "build-only"`, `hex` (**unsigned** transaction hex), unsigned `tx`, `fee`, `method`, `contract` |
+
+`signed` is the signed transaction in the chain's own form — a TRON transaction object including `signature[]`, or `{raw, hash}` on EVM.
+
+The `fee` object is shaped by the network's fee model: `tron-resource` reports the estimated `energy` and `availableEnergy`; `eip1559` / `legacy` report `maxCostWei`, `gasLimit` and `maxPerGasWei`. On EVM `data` additionally carries `nonce`, and `hex` is a `0x` RLP encoding rather than protobuf.
 
 ## Exit status
 
-`0` submitted (or built/signed in early-exit modes) · `1` execution failure (`watch_only_no_signer`, `auth_failed`, `rpc_error`, `timeout` — on timeout the tx may still be in flight; check [`tx status`](../tx/status.md)) · `2` usage error (`invalid_value`, conflicting modes).
+`0` submitted, with `stage` `confirmed`, `failed`, or `submitted` (or built/signed in early-exit modes) · `1` execution failure (`execution_reverted` — the call reverts when estimated, in every mode, `watch_only_no_signer`, `auth_failed`, `nonce_too_low` — `--dry-run` with an already-mined `--nonce`, `rpc_error`, `timeout` — on timeout the tx may still be in flight; check [`tx status`](../tx/status.md)) · `2` usage error (`invalid_value` — malformed values; `invalid_option` — conflicting modes, or a fee or multi-sig flag scoped to the other family).
 
 ## See also
 
-[`contract call`](call.md) · [`contract deploy`](deploy.md) · [`tx broadcast`](../tx/broadcast.md) · [Energy & bandwidth](../../concepts/energy-bandwidth.md)
+[`contract call`](call.md) · [`contract deploy`](deploy.md) · [`tx broadcast`](../tx/broadcast.md) · [Energy & bandwidth](../../concepts/energy-bandwidth.md) · [Fee models](../../concepts/networks.md#fees-the-evm-gas-model)

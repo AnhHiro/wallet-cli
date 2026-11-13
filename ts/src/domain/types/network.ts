@@ -1,71 +1,107 @@
-/**
- * SharedTypes — identity & network: NetworkId/Descriptor, Config, capabilities.
- */
 import type { OutputMode } from "./primitives.js";
 
-export type NetworkId = string; // canonical, e.g. "tron:nile"
+export type NetworkId = string; // canonical, e.g. "tron:3448148188"
 export type AccountRef = string; // "wlt_x.0" (HD) / "wlt_k" (privateKey)
+// The account a command acts on: an AccountRef, or an address the account store resolves per family.
+export type AccountSelector = AccountRef | string;
 
-export type FeeModel = "legacy" | "eip1559" | "tron-resource";
+export type FeeModel = "legacy" | "eip1559" | "tron-resource" | "evm-gas";
 
-/** fields shared by every family; `family` is the discriminant for the union below. */
 interface NetworkBase {
   id: NetworkId;
   chainId: string;
-  aliases: string[];
+  // Native coin symbol varies by network within a family (e.g. ETH vs BNB).
+  nativeSymbol: string;
+  // Testnet coins have no USD valuation.
+  testnet?: boolean;
   feeModel?: FeeModel;
   capabilities: string[];
+  // RPC authentication header; apiKey must be masked in output and stored with mode 0600.
+  apiKeyHeader?: string;
+  apiKey?: string;
 }
 
-/** TRON network. Reached via tronweb, which is HTTP-based — `httpEndpoint` is a FullNode HTTP REST
- *  fullHost (NOT gRPC :50051 nor the eth-style JSON-RPC). Self-hosting → point it at your node's :8090. */
+// httpEndpoint is a FullNode HTTP REST endpoint, not gRPC or EVM JSON-RPC.
 export interface TronNetworkDescriptor extends NetworkBase {
   family: "tron";
   httpEndpoint?: string;
-  /** Official walletadapter multi-sign service. Credentials are stored separately in Config. */
+  // TronLink service URL; credentials are stored separately in Config.
   tronlinkHttpEndpoint?: string;
-  /** Official GasFree service plus the immutable TIP-712 controller domain. */
+  // GasFree service and TIP-712 controller domain.
   gasfree?: GasFreeNetworkConfig;
+  sunswap?: SunSwapNetworkConfig;
+  sunpump?: SunPumpNetworkConfig;
 }
 
-/** Single family today (TRON). Kept as a named alias so adding a family later means re-introducing
- *  a discriminated union here without churn at every reference. */
-export type NetworkDescriptor = TronNetworkDescriptor;
+// JSON-RPC network; chainId is a decimal EIP-155 id.
+export interface EvmNetworkDescriptor extends NetworkBase {
+  family: "evm";
+  httpEndpoint?: string;
+}
 
-export interface CapabilityDescriptor {
-  key: string;
-  summary: string;
+export type NetworkDescriptor = TronNetworkDescriptor | EvmNetworkDescriptor;
+
+export function isTronNetwork(network: NetworkDescriptor): network is TronNetworkDescriptor {
+  return network.family === "tron";
+}
+
+// Returns host only to avoid exposing URL credentials; invalid or missing URLs return empty.
+export function endpointHost(url: unknown): string {
+  if (typeof url !== "string" || url === "") return "";
+  try {
+    return new URL(url).host;
+  } catch {
+    return "";
+  }
 }
 
 export interface Config {
-  /** one concrete default network for all chain commands when --network is omitted. */
+  // Used when --network is omitted.
   defaultNetwork?: string;
   defaultOutput: OutputMode;
+  // Default command deadline; 0 means no deadline.
   timeoutMs: number;
-  /** default polling cap for broadcast commands' --wait, in ms (overridden by --wait-timeout). */
-  waitTimeoutMs: number;
   networks: Record<NetworkId, NetworkDescriptor>;
-  /** USD-valuation source for `account portfolio`. Missing → builtin CoinGecko. */
+  // Resolve to canonical ids at the --network boundary.
+  aliases: Record<string, NetworkId>;
+  // Portfolio valuation; defaults to CoinGecko.
   price?: PriceConfig;
-  /** TronLink collaboration credentials for the currently selected service environment. */
   tronlinkSecretId?: string;
   tronlinkSecretKey?: string;
   tronlinkChannel?: string;
-  /** GasFree Open Platform credentials. The secret is never rendered in clear text. */
+  // Mask GasFree credentials in output.
   gasfreeApiKey?: string;
   gasfreeApiSecret?: string;
+  // Mask the B.AI bearer key in output.
+  baiApiKey?: string;
 }
 
 export interface GasFreeNetworkConfig {
-  /** HTTPS origin only; request paths are appended by the GasFree adapter. */
+  // HTTPS origin only; the adapter appends paths.
   baseUrl: string;
   apiPrefix: string;
-  /** Decimal uint256 value to avoid passing chain identifiers through floating point. */
+  // Decimal uint256.
   controllerChainId: string;
   verifyingContract: string;
 }
 
-/** price service config ; best-effort — failures never fail a balance read. */
+// Optional service fields enable capabilities; contract addresses come from SDK chain config.
+export interface SunSwapNetworkConfig {
+  // HTTPS origin only; the adapter appends paths.
+  marketApiBaseUrl?: string;
+  routerApiBaseUrl?: string;
+  // Enables liquidity commands and position-info.
+  liquidity?: boolean;
+}
+
+export interface SunPumpNetworkConfig {
+  // Enables sunpump buy/sell and the curve branch of sunswap swap.
+  curve?: boolean;
+  // Catalogue API URL; absent disables catalogue reads independently of curve trading.
+  apiBaseUrl?: string;
+}
+
+// Valuation failures must not fail balance reads.
 export interface PriceConfig {
   provider: "coingecko" | "none";
   baseUrl?: string;

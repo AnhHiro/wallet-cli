@@ -6,20 +6,37 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The repository holds two independent implementations:
 
-- `java/` — the original REPL-first implementation, described by the rest of this file.
-- `ts/` — the agent-first TypeScript rewrite (npm package `@tron-walletcli/wallet-cli`). See the
-  **TypeScript Implementation** section below and `ts/README.md`.
+- `ts/` — the agent-first TypeScript rewrite (npm package `@tron-walletcli/wallet-cli`). See
+  [TypeScript](#typescript-ts) and `ts/README.md`.
+- `java/` — the original REPL-first implementation. See [Java](#java-java).
 
-Everything below (except the TypeScript Implementation section) refers to the Java implementation.
-**All Java paths are relative to `java/`, and all Java commands are run from that directory**
-(`cd java` first).
+## Graphify
 
-## TypeScript Implementation
+Use the local code graph when you need to explore: where a symbol is used, how a flow passes through modules,
+or what a change affects. Query it with
+`bash scripts/graphify.sh query "<symbol or question>" --budget 1200` from the repository root.
+Use this wrapper to select the project's pinned Graphify version and disable LLM backends. When you already
+know the file and lines, or need every occurrence of a string, use source search instead.
 
-The `ts/` package is a self-contained, agent-first CLI (Node.js 20+, ESM, TypeScript). Every command
-has a stable JSON envelope, deterministic exit codes, and discoverable schemas; interactive prompts
-are used only for secret input (create / import / backup / delete). **All `ts/` commands run from the
-`ts/` directory.**
+- Initial setup: `bash scripts/graphify.sh setup` (requires `uv` and Python 3.13).
+- Refresh only before a query, when the graph may be stale (a new session, a branch change, or code edits since
+  the last refresh): `bash scripts/graphify.sh refresh`. Extraction reuses unchanged files. If refresh fails,
+  say the graph is stale and use source search.
+- From `ts/` or `java/`, use `bash ../scripts/graphify.sh` with the same arguments. The wrapper changes
+  to the repository root and updates the shared graph for both implementations.
+- View `graphify-out/graph.html` for communities or `graphify-out/GRAPH_TREE.html` for symbols by file;
+  query data is in `graphify-out/graph.json` and the summary is in
+  `graphify-out/GRAPH_REPORT.md`. These generated files and the local Python environment are git-ignored.
+- The scan covers code and tests in both implementations; `.graphifyignore` excludes generated code,
+  snapshots, build output, and local state. Document semantics are outside this code-only graph.
+- Confirm graph findings in source, especially port-to-adapter wiring in `ts/src/bootstrap/composition.ts`.
+  Architecture rules and automated checks remain authoritative. If Graphify is unavailable, use source search.
+
+## TypeScript (`ts/`)
+
+A self-contained, agent-first CLI (Node.js 22.23.4+ / 24.22.1+ / 26.12.1+, ESM, TypeScript). Every command has a
+stable JSON envelope, deterministic exit codes, and discoverable schemas; interactive prompts are used only for
+secret input (create / import / backup / delete). **All `ts/` commands run from the `ts/` directory.**
 
 ```bash
 cd ts
@@ -28,43 +45,56 @@ npm run build          # bundle to dist/ via tsup (bin: wallet-cli -> dist/index
 npm run dev -- <args>  # run from source via tsx (e.g. npm run dev -- create --label main)
 npm test               # vitest (tests are co-located as *.test.ts)
 npm run typecheck      # tsc --noEmit
-npm run depcruise      # dependency-cruiser — enforces the architecture rules below
+npm run depcruise      # dependency-cruiser — enforces the layer rules
+npm run lint           # ESLint, with known violations suppressed
 ```
 
-### Architecture (hexagonal / ports & adapters)
+`npm run depcruise` uses `ts/.dependency-cruiser-known-violations.json` and fails on new violations or
+stale/duplicate baseline entries. After fixing a known violation or enabling a rule with existing violations,
+run `npm run depcruise:baseline` from `ts/`, review the exact entries added or removed, and rerun
+`npm run depcruise`. Commit the baseline diff with the corresponding code or rule change. Regeneration records
+all current violations; fix unintended new violations before regenerating. To see unsuppressed diagnostics,
+run `npx --no-install depcruise src`.
 
-Dependencies point inward. The source of truth is
-`ts/docs/typescript-wallet-cli-architecture-source-of-truth.md` — read it before changing
-boundaries, ports, command routing, or the JSON contract. `depcruise` enforces these rules in CI.
+`npm run lint` uses `ts/eslint-suppressions.json`, ESLint's bulk suppressions file, which records a violation
+count per file and rule. It fails when a count rises, when it falls (the entry stays until regeneration), and
+on an entry for a file that is deleted, git-ignored, or ignored by ESLint (including `--ignore-pattern`).
+Keys must use ESLint's relative POSIX paths, such as `src/example.ts`; aliases such as `./src/example.ts` fail.
+Counts are compared, not locations, so fixing one violation and adding another of the same rule in the same
+file passes. After fixing a known
+violation or enabling a rule with existing violations, run `npm run lint:baseline` from `ts/`, review the exact
+entries added or removed, and rerun `npm run lint`; commit the diff as for depcruise. Pass the same
+`--ignore-pattern` options to both commands, for example for local git-ignored directories. To see the suppressed
+diagnostics, run `npx --no-install eslint . --format json` and read each file's `suppressedMessages`.
+Boolean ignore options use the last setting: `--ignore` or `--no-ignore`, optionally followed by `=true`
+or `=false`. The lint wrapper rejects other assignment values, including whitespace-padded booleans.
 
-| Area (`ts/src/…`) | Role | May depend on | Must NOT depend on |
-|---|---|---|---|
-| `domain` | Pure rules & values, zero I/O (address, amounts, derivation, wallet, family, errors) | Node / pure libs only | application, adapters, bootstrap |
-| `application` | Use cases, services, contracts, and **ports** (interfaces it owns) | `domain` | adapters, bootstrap |
-| `adapters/inbound` | CLI driving side — parse argv, route to use cases, render output | application, domain | adapters/outbound, bootstrap |
-| `adapters/outbound` | Implements application ports — keystore, TronWeb/Tron gateway, Ledger, price, config, persistence | application ports, domain | adapters/inbound, bootstrap |
-| `bootstrap` | Composition root + process lifecycle (`runner.ts`, `composition.ts`, `argv.ts`, `families/`) | all areas | — (assembly only) |
+Local ESLint rules live in `ts/eslint-rules/`; their tests in `ts/test/lint/rules/` run with
+`npm run test:unit`. The baseline can include test and tooling files. The npm-script integration suite
+`ts/test/lint/suppressions.test.ts` remains separate from these rule tests.
 
-Key points:
-- **Ports live in `application/ports/`** (e.g. `wallet-repository`, `tron-gateway`, `ledger-device`,
-  `price-provider`); outbound adapters implement them (dependency inversion).
-- **Chain-family differences** are isolated in the `tron` family — `application/use-cases/tron/`,
-  `adapters/outbound/chain/tron/`, and the family plugin under `bootstrap/families/`. EVM is planned,
-  not yet public.
-- **A single Zod schema per command** drives validation, yargs arity, help text, and JSON Schema.
-- **Secrets** (private keys, mnemonics, BIP39 passphrases) are encrypted at rest and never accepted
-  from argv or env — only a dedicated stdin channel or hidden TTY prompt.
+### Development rules
 
-### Adding a TypeScript command
+The rules for `ts/` are in `ts/docs/dev/rules/`. They are the single source of truth; do not restate them here.
+
+@ts/docs/dev/rules/architecture.md
+@ts/docs/dev/rules/comments.md
+
+Which commands each chain family supports: the `families` tags in `wallet-cli --json-schema`.
+
+### Adding a command
 
 1. Add the command module under `adapters/inbound/cli/commands/` with its Zod schema.
-2. Route it to an application use case (`application/use-cases/…`, e.g. `tron/transaction-service.ts`);
-   do not put I/O or chain logic in the inbound layer.
-3. If it needs new I/O, define a **port** in `application/ports/` and implement it in
-   `adapters/outbound/`. Wire it in `bootstrap/composition.ts`.
+2. Route it to an application use case under `application/use-cases/`.
+3. If it needs new I/O, define a port in `application/ports/`, implement it in `adapters/outbound/`, and wire
+   it in `bootstrap/composition.ts`.
 4. Add co-located `*.test.ts` and run `npm run depcruise && npm run typecheck && npm test`.
 
-## Build & Run
+## Java (`java/`)
+
+**All Java paths are relative to `java/`, and all Java commands are run from that directory** (`cd java` first).
+
+### Build & Run
 
 ```bash
 # Build the project (generates protobuf sources into src/main/gen/)
@@ -73,13 +103,9 @@ Key points:
 # Build fat JAR (output: build/libs/wallet-cli.jar)
 ./gradlew shadowJar
 
-# Run in REPL 交互模式 (human-friendly, interactive prompts)
+# Run the interactive shell (the only way to run it)
 ./gradlew run
 # Or after building: java -jar build/libs/wallet-cli.jar
-
-# Run in standard CLI mode (non-interactive, scriptable)
-java -jar build/libs/wallet-cli.jar --network nile get-account --address TXyz...
-java -jar build/libs/wallet-cli.jar --output json --network nile get-account --address TXyz...
 
 # Run tests
 ./gradlew test
@@ -93,74 +119,53 @@ java -jar build/libs/wallet-cli.jar --output json --network nile get-account --a
 
 Java 8 source/target compatibility. Protobuf sources are in `src/main/protos/` and generate into `src/main/gen/` — this directory is git-tracked but rebuilt on `clean`.
 
-## QA Verification
+### End-to-end coverage
 
-The `qa/` directory contains shell-based parity tests that compare interactive REPL output vs standard CLI (text and JSON modes). Requires a funded Nile testnet account.
+`java/qa-repl/` drives the real interactive shell over a pty (`expect`) against a
+funded Nile account — wallet lifecycle, account queries, a signed 1 TRX transfer, and
+the not-logged-in guards. `./gradlew build` passing does **not** mean the shell still
+works, so run it whenever you touch shared helpers:
 
 ```bash
-# Run QA verification (needs TRON_TEST_PRIVATE_KEY env var for private key)
-TRON_TEST_PRIVATE_KEY=<nile-private-key> bash qa/run.sh verify
-
-# QA config is in qa/config.sh; test commands are in qa/commands/*.sh
-# MASTER_PASSWORD env var is used for keystore auto-login (default: testpassword123A)
+cd java
+./gradlew shadowJar
+./qa-repl/run.sh build/libs/wallet-cli.jar head        # REPL regression
+./qa-repl/cli-boundary.sh build/libs/wallet-cli.jar    # entry point takes only --version/--help
 ```
 
-## Architecture
+### Architecture
 
 This is a **TRON blockchain CLI wallet** built on the [Trident SDK](https://github.com/tronprotocol/trident). It communicates with TRON nodes via gRPC.
 
-### Two CLI Modes
+#### One CLI Mode
 
-1. **REPL 交互模式** (human-friendly) — `Client` class with JCommander `@Parameters` inner classes. Entry point: `org.tron.walletcli.Client`. Features tab completion, interactive prompts, and conversational output. This is the largest file (~4900 lines). Best for manual exploration and day-to-day wallet management by humans.
-2. **Standard CLI 模式** (AI-agent-friendly) — `StandardCliRunner` with `CommandRegistry`/`CommandDefinition` pattern in `org.tron.walletcli.cli.*`. Supports `--output json`, `--network`, `--quiet` flags. Commands are registered in `cli/commands/` classes (e.g., `WalletCommands`, `TransactionCommands`, `QueryCommands`). Designed for automation: deterministic exit codes, structured JSON output, no interactive prompts, and env-var-based authentication — ideal for AI agents, scripts, and CI/CD pipelines.
+**Interactive REPL** — `Client` class with JCommander `@Parameters` inner classes. Entry point:
+`org.tron.walletcli.Client`. Features tab completion, interactive prompts, and conversational
+output. This is the largest file (~4800 lines).
 
-The standard CLI suppresses all stray stdout/stderr in JSON mode to ensure machine-parseable output. Authentication is automatic via `MASTER_PASSWORD` env var + keystore files in `Wallet/`.
+The shell is started one way only: a bare `java -jar wallet-cli.jar`. The entry point recognises
+`--version` and `--help` and nothing else; any other argument prints a one-line pointer to the
+TypeScript CLI on stderr and exits 2. Non-interactive, scriptable and CI use belongs to `ts/`
+(npm `@tron-walletcli/wallet-cli`).
 
-### Standard CLI Contract
-
-Before changing parser behavior, auth flow, JSON output, command success/failure semantics, or `qa/` expectations for
-the standard CLI, read:
-
-- `java/docs/standard-cli-contract-spec.md`
-
-Treat that file as the source of truth for the standard CLI contract unless the repository owner explicitly decides to
-revise it.
-
-### Request Flow
+#### Request Flow
 
 ```
-# Standard CLI mode:
-User Input → GlobalOptions → StandardCliRunner → CommandRegistry → CommandHandler → WalletApiWrapper → WalletApi → Trident SDK → gRPC → TRON Node
-
-# Interactive REPL mode:
 User Input → Client (JCommander) → WalletApiWrapper → WalletApi → Trident SDK → gRPC → TRON Node
 ```
 
-### Key Classes
+#### Key Classes
 
-- **`org.tron.walletcli.Client`** — Legacy REPL entry point and CLI command dispatcher. Each command is a JCommander `@Parameters` inner class.
-- **`org.tron.walletcli.cli.StandardCliRunner`** — New standard CLI executor. Handles network init, auto-authentication, JSON stream suppression, and command dispatch.
-- **`org.tron.walletcli.cli.CommandRegistry`** — Maps command names/aliases to `CommandDefinition` instances. Supports fuzzy suggestion on typos.
-- **`org.tron.walletcli.cli.CommandDefinition`** — Immutable command metadata (name, aliases, options, handler). Built via fluent `Builder` API.
-- **`org.tron.walletcli.cli.OutputFormatter`** — Formats output as text or JSON. In JSON mode, wraps results in `{"success":true,"data":...}` envelope.
+- **`org.tron.walletcli.Client`** — REPL entry point and command dispatcher. Each command is a JCommander `@Parameters` inner class.
 - **`org.tron.walletcli.WalletApiWrapper`** — Orchestration layer between CLI and core wallet logic. Handles transaction construction, signing, and broadcasting.
 - **`org.tron.walletserver.WalletApi`** — Core wallet operations: account management, transaction creation, proposals, asset operations. Delegates gRPC calls to Trident.
 - **`org.tron.walletcli.ApiClientFactory`** — Creates gRPC client instances for different networks (mainnet, Nile testnet, Shasta testnet, custom).
 
-### Adding a New Standard CLI Command
-
-1. Create or extend a class in `cli/commands/` (e.g., `TransactionCommands.java`)
-2. Build a `CommandDefinition` via `CommandDefinition.builder()` with name, aliases, options, and handler
-3. Register it in the appropriate `register(CommandRegistry)` method
-4. The handler receives `(ParsedOptions, WalletApiWrapper, OutputFormatter)` — use `formatter.success()/error()` for output
-
-### Package Organization
+#### Package Organization
 
 | Package | Purpose |
 |---------|---------|
-| `walletcli` | CLI entry points, API wrapper |
-| `walletcli.cli` | Standard CLI framework: registry, definitions, options, formatter |
-| `walletcli.cli.commands` | Standard CLI command implementations by domain |
+| `walletcli` | REPL entry point, API wrapper |
 | `walletserver` | Core wallet API and gRPC communication |
 | `common` | Crypto utilities, encoding, enums, shared helpers |
 | `core` | Configuration, data converters, DAOs, exceptions, managers |
@@ -170,16 +175,16 @@ User Input → Client (JCommander) → WalletApiWrapper → WalletApi → Triden
 | `multi` | Multi-signature transaction handling |
 | `gasfree` | GasFree transaction API (transfer tokens without gas) |
 
-### Configuration
+#### Configuration
 
 - **Network config:** `src/main/resources/config.conf` (HOCON format via Typesafe Config)
 - **Logging:** `src/main/resources/logback.xml` (Logback, INFO level console + rolling file)
 - **Lombok:** `lombok.config` — uses `logger` as the log field name (not the default `log`)
 
-### Key Frameworks & Libraries
+#### Key Frameworks & Libraries
 
 - **Trident SDK 0.11.0** — All gRPC API calls to TRON nodes
-- **JCommander 1.82** — CLI argument parsing (REPL 交互模式)
+- **JCommander 1.82** — CLI argument parsing (interactive REPL)
 - **JLine 3.25.0** — Interactive terminal/readline
 - **BouncyCastle** — Cryptographic operations
 - **Protobuf 3.25.8 / gRPC 1.75.0** — Protocol definitions and transport

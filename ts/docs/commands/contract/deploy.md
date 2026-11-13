@@ -1,43 +1,79 @@
 # wallet-cli contract deploy
 
-Deploy a smart contract.
+Deploy contract bytecode.
 
 ## Synopsis
 
 ```
-wallet-cli contract deploy --abi <json> --bytecode <hex> --fee-limit <sun>
-                           [--params <json>]
-                           [--dry-run | (--sign-only | --build-only) [--expiration <ms>] | --wait [--wait-timeout <ms>]] [--permission-id <n>] [options]
+wallet-cli contract deploy (--artifact <path> | --code <hex> | --code-file <path>)
+                           [--constructor-args <json> | --constructor-params <json>]
+                           [--constructor-signature <sig>]
+                           [--dry-run | --sign-only | --build-only | --wait | --no-wait]
+                           [--abi <json>] [--fee-limit <sun>] [--permission-id <n>] [--expiration <ms>]
+                           [--gas-limit <n>] [--max-fee <gwei>] [--priority-fee <gwei>] [--nonce <n>]
+                           [options]
 ```
 
 ## Description
 
-Deploys compiled contract bytecode from the active account (or `--account`) and reports the new contract address. `--fee-limit` is **required** here (deployments are energy-heavy; there is no safe default). Constructor arguments go via `--params` alone — the parameter types are taken from the constructor entry in the `--abi` you pass.
+Deploys contract creation bytecode from the active account (or `--account`) and reports the new contract's address, on TRON and EVM networks alike.
 
-Two shapes are checked before anything is built, both reported as `invalid_value` at exit `2`:
+**Where the bytecode comes from** — exactly one of three, else `invalid_option`:
 
-- **`--params` takes raw positional values here**, e.g. `[100, "T..."]`. The `{"type","value"}` entries that [`contract call`](call.md) and [`contract send`](send.md) take are rejected — deploy reads the types from the ABI's constructor instead.
-- **The ABI's `constructor` entry needs a string `stateMutability`** (`"nonpayable"` or `"payable"`). `solc` emits it; an ABI that was hand-trimmed, or produced by `solc` older than 0.5, may not have it.
+| Source | Use it when |
+|---|---|
+| `--artifact <path>` | **Preferred.** A compiler artifact (Foundry, Hardhat/sunhat, TronBox) that holds *both* the bytecode and the ABI, so the constructor's types come from the compiler rather than from you |
+| `--code-file <path>` | You have only the bytecode, in a file — creation bytecode routinely exceeds the shell's argument limit |
+| `--code <hex>` | You have only the bytecode and it is short enough to pass inline |
 
-Same execution model as other broadcast commands: `--dry-run` previews, `--sign-only` outputs a signed transaction for [`tx broadcast`](../tx/broadcast.md), default returns at submission, `--wait` blocks until confirmed/failed.
+An artifact is read for `.bytecode.object`, `.bytecode`, or `.evm.bytecode.object`, and its `abi` when present. An artifact with no creation bytecode, or holding only `"0x"` (an interface or abstract contract), is refused rather than deployed as nothing.
+
+**Where the constructor's types come from.** `--constructor-args` takes bare values (`["18","MyToken"]`) and needs the types from somewhere: `--artifact`'s ABI, an explicit `--constructor-signature`, or `--abi` on TRON. With none of those it is `invalid_value`. `--constructor-params` takes self-describing `{"type","value"}` entries instead and needs no ABI, but does not combine with `--artifact`.
+
+**TRON needs an ABI.** Pass `--artifact` or `--abi`; passing both is an error. `--abi` is TRON-only, and the ABI's `constructor` entry needs a string `stateMutability` (`"nonpayable"` / `"payable"`) — `solc` emits it, but a hand-trimmed ABI or one from `solc` older than 0.5 may not. `--constructor-signature` is not accepted on TRON.
+
+Execution modes match the other transaction-building write commands: `--dry-run` previews, `--sign-only` outputs a signed transaction for [`tx broadcast`](../tx/broadcast.md), `--build-only` an unsigned one, the default waits until confirmed or failed, `--no-wait` returns at submission.
+
+Fee flags follow the family — `--fee-limit` (TRON, default `100000000` SUN) or `--gas-limit` / `--max-fee` / `--priority-fee` / `--nonce` (EVM). Help tags each set, and using one on the other family is refused with `invalid_option`.
 
 Requires an account. The master password (via `--password-stdin`) is needed only by the modes that sign — `--dry-run` and `--build-only` do not unlock the wallet and run without it. Watch-only accounts fail with `watch_only_no_signer` in a signing mode.
+
+On TRON the Ledger app cannot sign `CreateSmartContract`: a Ledger account can dry-run or build, but signing modes fail with `ledger_unsupported`. The restriction does not apply to EVM deployment through the Ethereum app.
 
 ## Options
 
 | Option | Description |
 |---|---|
-| `--abi <string>` | **Required.** Contract ABI as a JSON array string |
-| `--bytecode <string>` | **Required.** Compiled bytecode as hex (0x-prefixed or bare) |
-| `--fee-limit <number>` | **Required.** Max energy fee to burn, in SUN |
-| `--params <string>` | Constructor args as a JSON array of raw positional values, e.g. `[100, "T..."]`; types are taken from the ABI constructor. Omit to pass no constructor args |
+| `--artifact <path>` | **Required** (one of). Compiler artifact holding the bytecode and ABI |
+| `--code <hex>` | **Required** (one of). Creation bytecode, hex-encoded |
+| `--code-file <path>` | **Required** (one of). File holding the creation bytecode |
+| `--constructor-args <json>` | Constructor arguments as a JSON array of bare values, e.g. `["18","MyToken"]` |
+| `--constructor-params <json>` | Constructor arguments as `{"type","value"}` entries; excludes `--artifact` |
+| `--constructor-signature <sig>` | The constructor's types when there is no ABI, e.g. `constructor(uint256,string)`; not needed with `--artifact`, and not accepted on TRON |
 | `--dry-run` | Estimate only; excludes `--sign-only` / `--build-only` |
-| `--sign-only` | Sign without broadcasting, output the signed hex; excludes `--dry-run` / `--build-only`; pairs with `--expiration` |
-| `--build-only` | Build only, output the **unsigned** hex; excludes `--dry-run` / `--sign-only`; pairs with `--expiration` |
-| `--expiration <ms>` | Transaction expiration in ms, up to `86400000` (24h); only with `--sign-only` or `--build-only`; omitted = node default (~60s) |
-| `--permission-id <n>` | Permission group to sign with (0=owner, 1=witness, 2-9=active); default `0` |
-| `--wait` / `--wait-timeout <ms>` | Poll after broadcast until confirmed/failed (cap default: config `waitTimeoutMs`, built-in 60000) |
+| `--sign-only` | Sign without broadcasting, output the signed hex; excludes `--dry-run` / `--build-only` |
+| `--build-only` | Build and estimate, output the **unsigned** hex; excludes `--dry-run` / `--sign-only` |
+| `--wait` | Poll after broadcast until confirmed or failed, up to the command deadline (`--timeout`); at the deadline it returns the submitted receipt with a warning. This is the default |
+| `--no-wait` | Return the submitted receipt without polling for confirmation |
 | `--password-stdin` | Master password from stdin |
+
+TRON only:
+
+| Option | Description |
+|---|---|
+| `--abi <json>` | Contract ABI as a JSON array string; on TRON, exactly one of `--abi` or `--artifact` |
+| `--fee-limit <sun>` | Max energy fee to burn, in SUN (default 100000000) |
+| `--permission-id <n>` | Permission group to sign with (0=owner, 1=witness, 2-9=active); default `0` |
+| `--expiration <ms>` | Transaction expiration in ms, up to `86400000` (24h); only with `--sign-only` or `--build-only`; omitted = node default (~60s) |
+
+EVM only:
+
+| Option | Description |
+|---|---|
+| `--gas-limit <n>` | Gas units to authorise; default is the node's estimate, unpadded |
+| `--max-fee <gwei>` | Maximum total fee per gas (EIP-1559 chains only) |
+| `--priority-fee <gwei>` | Tip per gas (EIP-1559 chains only) |
+| `--nonce <n>` | Transaction nonce; default is the account's pending nonce. Under `--dry-run` an explicit nonce is checked against the account's *mined* count and a spent one fails with `nonce_too_low` before any estimate; a nonce merely ahead of the next one stays a `meta.warnings` gap notice |
 
 Plus the [global options](../index.md#global-options-every-command).
 
@@ -45,8 +81,14 @@ Plus the [global options](../index.md#global-options-every-command).
 
 In the examples, `$PW` is your master password (from an environment variable, password manager, etc.), fed on stdin via `--password-stdin`.
 
+From a compiler artifact — the same command on either family, since the artifact carries the ABI; with `--no-wait` it returns at submission:
+
 ```bash
-echo "$PW" | wallet-cli contract deploy --abi "$(cat MyToken.abi.json)" --bytecode "$(cat MyToken.bin)" --fee-limit 1000000000 --network tron:nile --password-stdin
+echo "$PW" | wallet-cli contract deploy --artifact ./build/contracts/Token.json --constructor-args '["18","MyToken"]' --network nile --no-wait --password-stdin
+```
+
+```bash
+echo "$PW" | wallet-cli contract deploy --artifact ./out/Token.sol/Token.json --constructor-args '["18","MyToken"]' --network sepolia --no-wait --password-stdin
 ```
 
 ```console
@@ -54,15 +96,34 @@ echo "$PW" | wallet-cli contract deploy --abi "$(cat MyToken.abi.json)" --byteco
   Address  TXg3jWThoa5AxuwRA4aRyFAhmRN9hjhQFU
   TxID     b7c...
   Status   pending — not yet on-chain
-! Track it: wallet-cli tx info --network tron:nile --txid b7c...
+! Track it: wallet-cli tx info --network tron:3448148188 --txid b7c...
+```
+
+From bare bytecode on EVM, stating the constructor's types yourself:
+
+```bash
+echo "$PW" | wallet-cli contract deploy --code-file ./Token.bin --constructor-signature 'constructor(uint8,string)' --constructor-args '["18","MyToken"]' --network sepolia --password-stdin
+```
+
+Rehearsing an EVM deploy — the address is already known, and the fee is a gas ceiling:
+
+```bash
+wallet-cli contract deploy --code 0x60006000f3 --network sepolia --dry-run
+```
+
+```console
+⏳ Dry run contract deploy
+  Address  0xF3741D160A1E64A8D71fFE64CC0F111ddC7720E5
+  Fee      ≤ 0.000117 ETH  (53,857 gas × 2.186156 gwei max)
+  Tx       {"data":"0...000000"}
 ```
 
 ```bash
-echo "$PW" | wallet-cli contract deploy --abi "$(cat MyToken.abi.json)" --bytecode "$(cat MyToken.bin)" --fee-limit 1000000000 --network tron:nile --password-stdin -o json
+echo "$PW" | wallet-cli contract deploy --artifact ./build/contracts/Token.json --network nile --no-wait --password-stdin -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"contract.deploy","data":{"kind":"contract-deploy","contractAddress":"TXg3jWThoa5AxuwRA4aRyFAhmRN9hjhQFU","stage":"submitted","txId":"b7c..."},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"contract.deploy","data":{"kind":"contract-deploy","contractAddress":"TXg3jWThoa5AxuwRA4aRyFAhmRN9hjhQFU","stage":"submitted","txId":"b7c..."},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 ## Output
@@ -71,13 +132,17 @@ echo "$PW" | wallet-cli contract deploy --abi "$(cat MyToken.abi.json)" --byteco
 
 | Stage | Fields |
 |---|---|
-| default (submit) | `kind: "contract-deploy"`, `contractAddress` (deterministic new address), `stage: "submitted"`, `txId` |
-| `--wait` (confirmed) | above, plus `confirmed`, `blockNumber`, `feeSun`, `failed` |
+| `--no-wait` (submitted) | `kind: "contract-deploy"`, `contractAddress`, `stage: "submitted"`, `txId` |
+| default or `--wait` (confirmed) | above, plus `confirmed`, `blockNumber`, `failed`, and the realised cost — `feeSun` on TRON, `gasUsed` / `feeWei` / `effectiveGasPriceWei` on EVM |
+| `--dry-run` | `kind`, `mode: "dry-run"`, `contractAddress`, `fee`, the unsigned `tx` (plus `nonce` on EVM) |
+| `--sign-only` / `--build-only` | `kind`, `mode`, `hex`, `fee`, the transaction object |
+
+`contractAddress` is known before the transaction confirms, but each family derives it differently. On EVM it is computed locally from the deployer and the nonce. On TRON the address derives from the final txID, so it is read back from the prepared transaction — after `--permission-id` / `--expiration` have been bound and the txID is settled — rather than computed from the builder's output.
 
 ## Exit status
 
-`0` submitted (or built/signed in early-exit modes) · `1` execution failure (`watch_only_no_signer`, `auth_failed`, `rpc_error`, `timeout`) · `2` usage error (`missing_option` — no `--fee-limit`; `invalid_value` — bad ABI or bytecode, `--params` in `{"type","value"}` form, or an ABI constructor without a string `stateMutability`).
+`0` submitted, with `stage` `confirmed`, `failed`, or `submitted` (or built/signed/dry-run in early-exit modes) · `1` execution failure (`watch_only_no_signer`, `ledger_unsupported` — TRON signing only, `auth_failed`, `nonce_too_low` — `--dry-run` with an already-mined `--nonce`, raised before the predicted contract address is computed, `rpc_error`, `timeout`) · `2` usage error — `file_not_found` (no artifact or bytecode file at that path), `invalid_option` for none or more than one of `--artifact` / `--code` / `--code-file`, or a TRON deploy with neither `--artifact` nor `--abi`, or with both, or `--constructor-args` with `--constructor-params`; or `invalid_value` for: `--constructor-args` with no type source; `--constructor-params` together with `--artifact`; an artifact with no creation bytecode; or an ABI constructor without a string `stateMutability`.
 
 ## See also
 
-[`contract info`](info.md) · [`contract send`](send.md) · [`tx status`](../tx/status.md)
+[`contract info`](info.md) · [`contract send`](send.md) · [`contract create2`](create2.md) · [`tx status`](../tx/status.md)

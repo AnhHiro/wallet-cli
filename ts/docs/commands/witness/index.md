@@ -10,6 +10,8 @@ The one economic knob is **brokerage**: the share of block rewards the SR keeps,
 
 Registration burns a fee (currently ≈ 9,999 TRX) and cannot be undone.
 
+> **TRON only.** Every command in this group implements a TRON protocol feature with no EVM counterpart; on an EVM network they fail with `family_mismatch` before any node call.
+
 ## Synopsis
 
 ```

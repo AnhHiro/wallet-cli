@@ -6,16 +6,6 @@ import { HelpService } from "./index.js";
 import { isChainCommand, type StreamManager } from "../contracts/index.js";
 import { composeCliRuntime } from "../../../../bootstrap/composition.js";
 
-/**
- * `wallet-cli --help` is where discovery starts, and its three group tables are HAND-WRITTEN
- * (help/index.ts #renderRoot) rather than derived from the registry. That list has already fallen
- * behind twice — `asset` / `exchange` and the governance groups each shipped registered, working,
- * and invisible at the root. For an agent-first CLI a command that cannot be found is a command
- * that cannot be used, so this test enumerates the REAL registry and fails when a top-level group
- * is missing from the root listing.
- *
- * It deliberately does not check descriptions or ordering — those are editorial. Only presence.
- */
 describe("wallet-cli --help lists every registered top-level command", () => {
   let previousHome: string | undefined;
 
@@ -29,11 +19,12 @@ describe("wallet-cli --help lists every registered top-level command", () => {
     else process.env.WALLET_CLI_HOME = previousHome;
   });
 
-  function rootHelp(): { text: string; heads: string[] } {
+  function rootHelp(tokens = ["--help"]): { text: string; heads: string[] } {
     const runtime = composeCliRuntime({
       globals: { output: "text", verbose: false },
       secretPaths: {},
       startedAt: Date.now(),
+      monotonicStart: performance.now(),
     });
     let text = "";
     const stream = {
@@ -46,8 +37,7 @@ describe("wallet-cli --help lists every registered top-level command", () => {
       readStdinOnce: () => "",
       warnings: () => [],
     } as unknown as StreamManager;
-    new HelpService(runtime.registry, stream, "0.0.0").handleMeta(["--help"]);
-    // every command's FIRST path segment — the name a user types to explore further
+    new HelpService(runtime.registry, stream, "0.0.0").handleMeta(tokens);
     const heads = [
       ...new Set(runtime.registry.all().map((c) => (isChainCommand(c) ? c.spec.path : c.path)[0]!)),
     ].sort();
@@ -56,22 +46,34 @@ describe("wallet-cli --help lists every registered top-level command", () => {
 
   it("names every top-level group somewhere in the root listing", () => {
     const { text, heads } = rootHelp();
-    // match the listing column only, so a name appearing inside prose cannot mask a missing row
+    // Match listing rows so prose cannot mask a missing command.
     const listed = new Set(
       text
         .split("\n")
-        .map((line) => /^ {2}([a-z][a-z0-9-]*)\s{2,}\S/.exec(line)?.[1])
+        .map((line) => /^ {2}([a-z0-9][a-z0-9-]*)\s{2,}\S/.exec(line)?.[1])
         .filter((name): name is string => name !== undefined),
     );
     expect(heads.filter((head) => !listed.has(head))).toEqual([]);
   });
 
-  it("covers the v4.12.0 additions specifically", () => {
+  it("covers the TRC10 and governance groups specifically", () => {
     const { text } = rootHelp();
     for (const group of ["asset", "exchange", "proposal", "witness"]) {
       expect(text, `${group} missing from wallet-cli --help`).toMatch(
         new RegExp(`^ {2}${group}\\s{2,}\\S`, "m"),
       );
+    }
+  });
+  it("lists chain and neutral BAI commands together exactly once", () => {
+    const { text } = rootHelp(["bai", "--help"]);
+    for (const verb of [
+      "recharge",
+      "report-recharge",
+      "usage-summary",
+      "usage-records",
+      "recharge-orders",
+    ]) {
+      expect(text.match(new RegExp(`^ {2}${verb}\\s+`, "gm")), verb).toHaveLength(1);
     }
   });
 });

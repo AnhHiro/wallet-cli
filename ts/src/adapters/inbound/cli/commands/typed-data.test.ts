@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import { typedDataSignSpec, typedDataSignBinding } from "./typed-data.js";
 
 const ctx = { activeAccount: "main" } as never;
-const net = { family: "tron", id: "nile", chainId: "728126428" } as never;
+const net = { family: "tron", nativeSymbol: "TRX", id: "nile", chainId: "728126428" } as never;
 
 const PAYLOAD = JSON.stringify({
   domain: { name: "SunPerp", version: "1", chainId: 728126428 },
@@ -22,7 +22,6 @@ describe("typed-data sign spec", () => {
     expect(typedDataSignSpec.auth).toBe("required");
   });
 
-  // the payload is not a secret, so argv is the only channel — no --typed-data-stdin exists.
   it("declares no stdin channel", () => {
     expect(typedDataSignSpec.stdin).toBeUndefined();
   });
@@ -55,10 +54,10 @@ describe("typed-data sign binding", () => {
     ).rejects.toMatchObject({ code: "invalid_value" });
   });
 
-  it("rejects a structurally invalid payload with invalid_value", async () => {
+  it("rejects a structurally invalid payload with invalid_payload", async () => {
     const svc = { sign: async () => stubResult };
     await expect(
       typedDataSignBinding(svc as never).run(ctx, net, { typedData: '{"domain":{},"types":{}}' }),
-    ).rejects.toMatchObject({ code: "invalid_value" });
+    ).rejects.toMatchObject({ code: "invalid_payload" });
   });
 });

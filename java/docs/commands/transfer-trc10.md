@@ -125,14 +125,22 @@ Example:
 ```console
 > TransferAsset TN3zfjYUmMFK3ZsHSsrdJoNRtGkQmZLBLz 1000001 1000
 > getaccount TN3zfjYUmMFK3ZsHSsrdJoNRtGkQmZLBLz  # View target account information after the transfer
-address: TN3zfjYUmMFK3ZsHSsrdJoNRtGkQmZLBLz
-    assetV2
+{
+  "address": "TN3zfjYUmMFK3ZsHSsrdJoNRtGkQmZLBLz",
+  "balance": 9999900000,
+  "assetV2": [
     {
-    id: 1000001
-    balance: 1000
-    latest_asset_operation_timeV2: null
-    free_asset_net_usageV2: 0
+      "key": "1000001",
+      "value": 1000
     }
+  ],
+  "free_asset_net_usageV2": [
+    {
+      "key": "1000001",
+      "value": 0
+    }
+  ]
+}
 ```
 
 ### ParticipateAssetIssue
@@ -146,31 +154,35 @@ Participate in the issuance of a TRC10 token.
 - `OwnerAddress` (optional) — the address of the account which initiated the transaction. Default: the address of the login account.
 - `ToAddress` — account address of TRC10 issuers.
 - `AssetID` — TRC10 token ID. Example: 1000001.
-- `Amount` — the number of TRC10 token to transfer.
+- `Amount` — the amount of **TRX you spend**, in SUN. It is *not* the number of tokens you receive: the tokens credited to you are `Amount / TrxNum * AssetNum` at the rate fixed when the token was issued, rounded down to a whole base unit. The TRX is transferred in full, so a truncated remainder is not refunded.
 
 The participation process must happen during the release of TRC10, otherwise an error may occur.
 
 Example:
 
 ```console
-> ParticipateAssetIssue TRGhNNfnmgLegT4zHNjEqDSADjgmnHvubJ 1000001 1000
+> ParticipateAssetIssue TRGhNNfnmgLegT4zHNjEqDSADjgmnHvubJ 1000001 1000  # spend 1000 SUN
 > getaccount TJCnKsPa7y5okkXvQAidZBzqx3QyQ6sxMW  # View remaining balance
-address: TJCnKsPa7y5okkXvQAidZBzqx3QyQ6sxMW
-assetV2
+{
+  "address": "TJCnKsPa7y5okkXvQAidZBzqx3QyQ6sxMW",
+  "balance": 9999900000,
+  "assetV2": [
     {
-    id: 1000001
-    balance: 1000
-    latest_asset_operation_timeV2: null
-    free_asset_net_usageV2: 0
+      "key": "1000001",
+      "value": 1000
     }
+  ]
+}
 ```
+
+The 1000 SUN spent above buys 1000 base units only because this token was issued at a rate of `TrxNum` 1 : `AssetNum` 1. At a rate of `TrxNum` 2 : `AssetNum` 1, the same 1000 SUN would credit 500. Query the rate with [`getAssetIssueById`](#how-to-obtain-trc10-token-information) before participating.
 
 ### ListAssetIssuePaginated
 
 Query the list of all the tokens by pagination. Returns a list of tokens that succeed the token located at offset.
 
 ```console
-> ListAssetIssuePaginated address code salt
+> ListAssetIssuePaginated offset limit
 ```
 
 Example:

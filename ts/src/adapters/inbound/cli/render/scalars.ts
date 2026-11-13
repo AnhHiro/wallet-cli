@@ -1,8 +1,6 @@
-/**
- * Scalar formatting - pure value-to-string helpers (numbers, time, identifiers).
- * No domain or layout knowledge; reusable across formatters and trivially unit-testable.
- */
 import { fromBaseUnits } from "../../../../domain/amounts/index.js";
+import { FAMILIES } from "../../../../domain/family/index.js";
+import { GWEI_DECIMALS } from "../../../../domain/evm/evm-gas.js";
 
 export function formatScalar(v: unknown): string {
   if (v === null || v === undefined) return "";
@@ -20,7 +18,7 @@ export function formatInt(v: unknown): string {
   return Number.isFinite(n) ? Math.trunc(n).toLocaleString("en-US") : String(v ?? "");
 }
 
-/** Group a decimal string's integer part without coercing or dropping fractional digits. */
+// Group the integer part without numeric coercion or loss of fractional digits.
 export function formatDecimal(v: unknown): string {
   const raw = String(v ?? "");
   const match = /^(-?)(\d+)(\.\d+)?$/.exec(raw);
@@ -29,15 +27,60 @@ export function formatDecimal(v: unknown): string {
   return `${sign}${integer!.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}${fraction}`;
 }
 
+// USD valuations use two decimal places.
 export function formatUsd(v: unknown): string {
+  return usd(v, 2);
+}
+
+const PRICE_SIGNIFICANT_DIGITS = 4;
+
+// USD prices below one cent truncate to four significant digits; others round to four decimals.
+export function formatUsdPrice(v: unknown): string {
+  const text = String(v ?? "").trim();
+  if (!/^-?\d+(\.\d+)?$/.test(text)) return usd(v, 4);
+  const negative = text.startsWith("-");
+  const [whole = "0", fraction = ""] = (negative ? text.slice(1) : text).split(".");
+  if (/^0*$/.test(whole) && /^0*$/.test(fraction)) return "0.0000";
+  if (!/^0*$/.test(whole) || !fraction.startsWith("00")) return usd(v, 4);
+  const firstSignificant = fraction.search(/[1-9]/);
+  const kept = fraction
+    .slice(0, firstSignificant + PRICE_SIGNIFICANT_DIGITS)
+    .padEnd(firstSignificant + PRICE_SIGNIFICANT_DIGITS, "0");
+  return `${negative ? "-" : ""}0.${kept}`;
+}
+
+function usd(v: unknown, digits: number): string {
   const n = Number(v);
   return Number.isFinite(n)
-    ? n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+    ? n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })
     : String(v ?? "");
 }
 
+const DISPLAY_DECIMALS = 6;
+const SMALLEST_SHOWN = `0.${"0".repeat(DISPLAY_DECIMALS - 1)}1`;
+
+// Truncate base-unit amounts to six decimals; mark tiny nonzero amounts instead of showing zero.
+export function formatAmount(v: unknown, decimals: number): string {
+  const exact = fromBaseUnits(String(v ?? "0"), decimals);
+  const [integer = "0", fraction = ""] = exact.split(".");
+  const shown = fraction.slice(0, DISPLAY_DECIMALS).replace(/0+$/, "");
+  if (shown === "" && integer === "0" && /[1-9]/.test(fraction)) {
+    return `<${SMALLEST_SHOWN}`;
+  }
+  return formatDecimal(shown === "" ? integer : `${integer}.${shown}`);
+}
+
 export function formatSun(v: unknown): string {
-  return fromBaseUnits(String(v ?? "0"), 6);
+  return formatAmount(v, FAMILIES.tron.nativeDecimals);
+}
+
+export function formatWei(v: unknown): string {
+  return formatAmount(v, FAMILIES.evm.nativeDecimals);
+}
+
+// Input is wei; output is gwei.
+export function formatGwei(v: unknown): string {
+  return formatAmount(v, GWEI_DECIMALS);
 }
 
 export function formatTime(v: unknown): string {
@@ -51,9 +94,7 @@ export function formatTime(v: unknown): string {
   return `${mm}-${dd} ${hh}:${mi}`;
 }
 
-/** epoch-ms → "YYYY-MM-DD HH:MM (in ~3 days)" / "(~2h ago)" — local time + a coarse relative hint.
- *  Shared by the reward / stake / delegated views so time reads consistently across the CLI.
- *  `now` is injectable for deterministic tests. Empty string for a missing/non-positive value. */
+// Input is epoch milliseconds; output uses local time with a relative hint.
 export function formatAtWithRelative(v: unknown, now: number = Date.now()): string {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return "";
@@ -71,7 +112,7 @@ export function formatAtWithRelative(v: unknown, now: number = Date.now()): stri
   return `${at} (${delta >= 0 ? `in ~${unit}` : `~${unit} ago`})`;
 }
 
-/** block timestamp -> "YYYY-MM-DD HH:MM:SS UTC". */
+// Input is epoch milliseconds; output uses UTC.
 export function formatUtc(v: unknown): string {
   const n = Number(v);
   if (!Number.isFinite(n) || n <= 0) return "unknown";
@@ -92,35 +133,32 @@ export function quote(s: string): string {
   return `"${s}"`;
 }
 
-/** contract method display name: strip the signature's parameter list, e.g. "transfer(address,uint256)" -> "transfer". */
 export function methodName(sig: string): string {
   return sig.replace(/\(.*/, "") || sig;
 }
 
-// Neutralize terminal control-sequence injection from untrusted labels / remote metadata.
-// Strips C0 (except the newline layout uses for line breaks), DEL, and C1 bytes: removing the
-// ESC (0x1B) and C1 introducers degrades any ANSI CSI / OSC payload to harmless literal text.
-// Built via RegExp so the source file itself carries no raw control bytes.
+// Strip terminal controls, preserving newlines for layout.
 const CONTROL_BYTES = new RegExp("[\\u0000-\\u0009\\u000B-\\u001F\\u007F-\\u009F]", "g");
 
-// Bidi and other invisible formatting characters are NOT control bytes — they pass straight through
-// the strip above — and for a security display they are the more dangerous half. U+202E reverses
-// the visible order of everything after it, so a chain-controlled permission name can make the
-// address or weight printed beside it read as something else; the zero-width characters can make
-// two different names look identical. These are MARKED rather than dropped: dropping them would
-// silently mangle legitimate right-to-left text, whereas an escape keeps the string honest and
-// makes tampering obvious. Built via RegExp so this file carries no raw formatting characters.
+// Escape invisible formatting characters to expose spoofing without silently altering RTL text.
 const INVISIBLE_FORMATTING = new RegExp(
   "[\\u061C\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2064\\u2066-\\u2069\\uFEFF]",
   "g",
 );
 
-/** strip terminal control bytes from a text-mode output frame (never applied in JSON mode). */
+const markInvisible = (c: string) =>
+  `<U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>`;
+
+// Sanitize text frames by stripping controls and marking invisible formatting characters.
 export function sanitizeText(s: string): string {
+  return s.replace(CONTROL_BYTES, "").replace(INVISIBLE_FORMATTING, markInvisible);
+}
+
+// Terminal controls other than newline and tab, shown as `\xNN` so stderr cannot drive the terminal.
+const TERMINAL_CONTROLS = new RegExp("[\\u0000-\\u0008\\u000B-\\u001F\\u007F-\\u009F]", "g");
+
+export function escapeControls(s: string): string {
   return s
-    .replace(CONTROL_BYTES, "")
-    .replace(
-      INVISIBLE_FORMATTING,
-      (c) => `<U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}>`,
-    );
+    .replace(TERMINAL_CONTROLS, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`)
+    .replace(INVISIBLE_FORMATTING, markInvisible);
 }

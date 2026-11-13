@@ -10,6 +10,8 @@ wallet-cli contract info --contract <address> [options]
 
 ## Description
 
+> **TRON only.** The ABI this reads is the one held on chain, which is a TRON protocol feature; on an EVM network the command fails with `family_mismatch`.
+
 Fetches a deployed contract's ABI and metadata (getContract + getContractInfo combined): name, method list, origin address, bytecode, energy settings. Useful before crafting a [`contract call`](call.md) / [`contract send`](send.md) — the ABI tells you the exact method signatures. Read-only — no account or password involved.
 
 ## Options
@@ -23,7 +25,7 @@ Plus the [global options](../index.md#global-options-every-command).
 ## Examples
 
 ```bash
-wallet-cli contract info --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network tron:nile
+wallet-cli contract info --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network nile
 ```
 
 ```console
@@ -33,11 +35,11 @@ Methods   33 (name / deprecate / approve …)
 ```
 
 ```bash
-wallet-cli contract info --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network tron:nile -o json
+wallet-cli contract info --contract TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf --network nile -o json
 ```
 
 ```json
-{"schema":"wallet-cli.result.v1","success":true,"command":"contract.info","data":{"address":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf","name":"TetherToken","functionCount":33,"methods":["name","deprecate","approve","deprecated","addBlackList","totalSupply","transferFrom","…"],"contract":{"origin_address":"41…","contract_address":"41…","abi":{},"bytecode":"…","name":"TetherToken"},"info":{"smart_contract":{},"runtimecode":"…","contract_state":{}}},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:nile","chainId":"nile"}}
+{"schema":"wallet-cli.result.v1","success":true,"command":"contract.info","data":{"address":"TXYZopYRdj2D9XRtbG411XZZ3kM5VkAeBf","name":"TetherToken","functionCount":33,"methods":["name","deprecate","approve","deprecated","addBlackList","totalSupply","transferFrom","…"],"contract":{"origin_address":"41…","contract_address":"41…","abi":{},"bytecode":"…","name":"TetherToken"},"info":{"smart_contract":{},"runtimecode":"…","contract_state":{}}},"meta":{"durationMs":15,"warnings":[]},"chain":{"family":"tron","network":"tron:3448148188","chainId":"3448148188"}}
 ```
 
 ## Output
@@ -55,7 +57,7 @@ Text output shows the human summary; the raw `contract` / `info` detail is json-
 
 ## Exit status
 
-`0` success · `1` execution failure (`rpc_error`; address is not a contract) · `2` usage error.
+`0` success · `1` execution failure (`rpc_error`; address is not a contract) · `2` usage error (`family_mismatch` on an EVM network).
 
 ## See also
 

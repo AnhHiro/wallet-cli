@@ -3,23 +3,25 @@ import { TronStakeService } from "./stake-service.js";
 import type { ChainGatewayProvider } from "../../ports/chain/gateway-provider.js";
 import type { TxPipeline } from "../../services/pipeline/index.js";
 import type { NetworkDescriptor } from "../../../domain/types/index.js";
+import { CommandDeadline } from "../../services/command-deadline.js";
+
+const NO_DEADLINE = new CommandDeadline(0);
 
 const net = {
-  id: "tron:nile",
+  id: "tron:3448148188",
   family: "tron",
+  nativeSymbol: "TRX",
   chainId: "nile",
   aliases: [],
   capabilities: [],
 } as NetworkDescriptor;
 const OWNER = "TQkDWJimyBEhkFcqEfCWNbb6tMDwmH1234";
-const scope = { activeAccount: {}, resolveAddress: () => OWNER } as never;
+const scope = { deadline: NO_DEADLINE, activeAccount: {}, resolveAddress: () => OWNER } as never;
 
-// A pipeline stub that exercises the build callback (where the pre-flight guard lives) exactly as
-// the real pipeline does: build → return a submitted receipt.
 function stubPipeline() {
   return {
     assertCanSign: () => {},
-    run: async (p: { build: (owner: string) => Promise<unknown> }) => {
+    runTron: async (p: { build: (owner: string) => Promise<unknown> }) => {
       await p.build(OWNER);
       return { stage: "submitted", txId: "0xdeadbeef" };
     },
@@ -41,7 +43,6 @@ describe("TronStakeService.withdraw pre-flight", () => {
     await expect(svc(gateway).withdraw(scope, net, {})).rejects.toMatchObject({
       code: "nothing_to_withdraw",
     });
-    // never builds/broadcasts a doomed tx → no phantom txid.
     expect(buildWithdrawExpireUnfreeze).not.toHaveBeenCalled();
   });
 

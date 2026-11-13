@@ -1,4 +1,6 @@
 import { defineConfig } from "vitest/config";
+import { join } from "node:path";
+import { availableParallelism } from "node:os";
 
 export default defineConfig({
   test: {
@@ -8,22 +10,33 @@ export default defineConfig({
         test: {
           name: "unit",
           environment: "node",
-          include: ["src/**/*.test.ts"],
+          // Leave one CPU for the coordinator/OS.
+          maxWorkers: Math.min(10, Math.max(1, availableParallelism() - 1)),
+          include: ["src/**/*.test.ts", "test/lint/rules/**/*.test.ts"],
           testTimeout: 20_000,
           hookTimeout: 20_000,
         },
       },
       {
-        // Golden tests spawn a fresh `node --import tsx src/index.ts` per case, which cold-transpiles the
-        // whole CLI import graph each time. Under parallel CPU load a single spawn can take far
-        // longer than vitest's default 5s testTimeout, causing intermittent timeout failures.
-        // Keep this suite above the child-process guard so hangs fail with subprocess details.
+        // Keep the test timeout above the 25s subprocess guard for diagnostics.
         test: {
           name: "golden",
+          // Each worker spawns a CLI process with SDK loading and real scrypt.
+          maxWorkers: Math.min(4, availableParallelism()),
+          // Vitest requires separate groups for different worker caps.
+          sequence: { groupOrder: 1 },
           environment: "node",
           include: ["test/**/*.test.ts"],
-          testTimeout: 20_000,
-          hookTimeout: 20_000,
+          exclude: ["test/lint/rules/**"],
+          // Allow repeated CLI startup and real scrypt on busy CI runners.
+          testTimeout: 60_000,
+          hookTimeout: 30_000,
+          // Preserve the installed-package entry supplied by verify:package.
+          globalSetup: ["./test/build-entry.ts"],
+          env: {
+            WALLET_CLI_TEST_ENTRY:
+              process.env.WALLET_CLI_TEST_ENTRY ?? join(process.cwd(), "dist", "index.js"),
+          },
         },
       },
     ],

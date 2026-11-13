@@ -84,7 +84,7 @@ wallet-cli encoding convert TBhCfAytTEh52WFL6HYr64i2nmc3u3TCUX
 ```
 
 ```console
-Error: invalid_value — base58 checksum mismatch (typo in the address?)
+error [invalid_value]: base58 checksum mismatch (typo in the address?)
 ```
 
 ## Output

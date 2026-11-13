@@ -12,13 +12,16 @@ export const WalletFormatters = {
   walletWatch: ((data) => {
     const d = asObj(data);
     return receipt(ok(), `Added watch-only account ${quote(displayName(d))}`, [
-      ["Address", firstAddress(d)],
+      ...addressPairs(d),
       ["Note", "read-only; signing operations will be rejected"],
     ]);
   }) satisfies TextFormatter,
   walletLedger: ((data) => renderLedgerImported(asObj(data))) satisfies TextFormatter,
-  walletList: ((data) =>
-    renderWalletList(Array.isArray(data) ? data.map(asObj) : [])) satisfies TextFormatter,
+  walletList: ((data, ctx) =>
+    renderWalletList(
+      Array.isArray(data) ? data.map(asObj) : [],
+      ctx?.net?.family,
+    )) satisfies TextFormatter,
   walletUse: ((data) => {
     const d = asObj(data);
     return receipt(ok(), `Active account: ${displayName(d)}`, addressPairs(d));
@@ -42,11 +45,17 @@ export const WalletFormatters = {
   }) satisfies TextFormatter,
   walletDerive: ((data) => {
     const d = asObj(data);
-    return receipt(ok(), `Derived sub-account ${quote(displayName(d))}`, [
-      ["Address", firstAddress(d)],
-      ["Active", d.active === true ? "yes" : ""],
-      ["Note", "shares master mnemonic; no separate backup needed"],
-    ]);
+    return receipt(
+      ok(),
+      `${d.status === "existing" ? "Selected existing account" : "Derived sub-account"} ${quote(displayName(d))}`,
+      [
+        ["Account ID", String(d.accountId ?? "")],
+        ["Index", d.index === null || d.index === undefined ? "" : formatInt(d.index)],
+        ...addressPairs(d),
+        ["Active", d.active === true ? "yes" : ""],
+        ["Note", "shares the wallet's recovery phrase"],
+      ],
+    );
   }) satisfies TextFormatter,
   walletDelete: ((data) => {
     const d = asObj(data);
@@ -56,8 +65,6 @@ export const WalletFormatters = {
       ["New active", d.newActive ? String(d.newActive) : ""],
     ]);
   }) satisfies TextFormatter,
-  // One command, two shapes: an export receipt, or the audit log when --records was given. They are
-  // told apart by `records` rather than by the command id, which the envelope carries separately.
   walletBackup: ((data) => {
     const d = asObj(data);
     if (Array.isArray(d.records)) return renderBackupRecords(d);
@@ -66,6 +73,8 @@ export const WalletFormatters = {
     return [
       receipt(warn(), `${keystore ? "Keystore" : "Backup"} written ${String(d.out ?? "")}`, [
         ["Account ID", String(d.accountId ?? "")],
+        // Keystores export one family's key; mnemonic backups cover all families.
+        ...(keystore && d.family ? [["Family", String(d.family)] as Pair] : []),
         ["Secret", secretLabel(d.secretType)],
         ["File mode", String(d.fileMode ?? "0600")],
         ["Bytes", String(d.bytes ?? "?")],
@@ -121,13 +130,10 @@ function renderLedgerImported(d: Obj): string {
   ].join("\n");
 }
 
-/** Tree view: each seed wallet is a group headed by its seed id (the `--seed` handle for `derive`),
- *  its accounts listed under `├─/└─` connectors as `[index] label`. Non-HD accounts group by type.
- *  Plain text only — the text-mode frame is control-byte-stripped (CLI-OUT-001) so ANSI colour
- *  can't survive here anyway; the active account is marked with a trailing `(active)`. */
-function renderWalletList(items: Obj[]): string {
-  if (items.length === 0) return "No wallets found.";
-  // group seeds by their seed id (wlt_x); non-HD accounts by type. Insertion order preserved.
+function renderWalletList(items: Obj[], family?: string): string {
+  const shown = family ? items.filter((d) => addressFor(d, family) !== undefined) : items;
+  if (shown.length === 0) return "No wallets found.";
+  items = shown;
   const groups = new Map<string, { hd: boolean; header: string; rows: Obj[] }>();
   for (const d of items) {
     const isSeed = d.type === "seed";
@@ -139,9 +145,10 @@ function renderWalletList(items: Obj[]): string {
   const leftOf = (d: Obj): string =>
     d.type === "seed" ? `[${d.index ?? "?"}] ${displayName(d)}` : displayName(d);
   const leftW = Math.max(...items.map((d) => leftOf(d).length));
-  const addrW = Math.max(...items.map((d) => firstAddress(d).length));
+  const addressOf = (d: Obj): string => (family ? (addressFor(d, family) ?? "") : firstAddress(d));
+  const addrW = Math.max(...items.map((d) => addressOf(d).length));
   const row = (d: Obj, last: boolean): string =>
-    `${last ? "└─ " : "├─ "}${leftOf(d).padEnd(leftW)}  ${firstAddress(d).padEnd(addrW)}  ${d.active ? "(active)" : ""}`.replace(
+    `${last ? "└─ " : "├─ "}${leftOf(d).padEnd(leftW)}  ${addressOf(d).padEnd(addrW)}  ${d.active ? "(active)" : ""}`.replace(
       /\s+$/,
       "",
     );
@@ -157,7 +164,6 @@ function displayName(d: Obj): string {
   return String(d.label ?? d.accountId ?? d.id ?? "unnamed");
 }
 
-/** non-empty address entries — drops families whose address is blank/absent. */
 function nonEmptyAddressEntries(d: Obj): Pair[] {
   return Object.entries(asObj(d.addresses))
     .filter(([, address]) => typeof address === "string" && address.length > 0)
@@ -169,18 +175,22 @@ function firstAddress(d: Obj): string {
   return first ? first[1] : "";
 }
 
-/** per-family address field pairs, addresses shown in full (§0.4 ②). */
 function addressPairs(d: Obj): Pair[] {
   return nonEmptyAddressEntries(d).map(
     ([family, address]) => [familyAddressLabel(family), address] as Pair,
   );
 }
 
+function addressFor(d: Obj, family: string): string | undefined {
+  const addresses = d.addresses as Record<string, unknown> | undefined;
+  const value = addresses?.[family];
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+
 function typeLabel(v: unknown): string {
   return sourceLabel(v);
 }
 
-/** The export audit log: newest first, UTC, one row per past export and the file it went to. */
 function renderBackupRecords(d: Obj): string {
   const records = (d.records as unknown[]).map(asObj);
   const page = asObj(d.pagination);
@@ -190,7 +200,7 @@ function renderBackupRecords(d: Obj): string {
   return `${header}\n${table(
     ["Time (UTC)", "Exported account", "Operation", "File"],
     records.map((r) => [
-      // The stored instant is second-precision UTC; minutes are enough to read a trail by.
+      // Stored timestamps are UTC.
       String(r.timestamp ?? "")
         .replace("T", " ")
         .slice(0, 16),

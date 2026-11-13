@@ -1,59 +1,11 @@
-/**
- * Builtin network defaults. config.yaml overrides these per id.
- * TRON endpoints are HTTP fullHosts (tronweb).
- */
 import type { NetworkDescriptor } from "../../../domain/types/index.js";
 
-// A network's `capabilities` lists only network-specific TRAITS — things not derivable from the
-// command surface. Command-backed capabilities are derived from the registered commands'
-// `capability` field and unioned in at composition time (runner). Single source.
-
-/** human-readable labels for network-specific trait keys (the non command-backed capabilities above).
- *  Empty today — TRON carries no extra traits; the lookup path stays for future families. */
-export const TRAIT_SUMMARIES: Record<string, string> = {};
-
-/** human-readable labels for command-backed capability keys (the keys commands declare via
- *  `capability`). Sibling of TRAIT_SUMMARIES; the runner resolves both the same way. */
-export const CAP_SUMMARIES: Record<string, string> = {
-  "account.balance.native": "native balance",
-  "account.balance.token": "token balance",
-  "account.portfolio": "holdings with USD valuation",
-  "account.activate": "activate a new TRON account",
-  "account.set": "set one-time on-chain account name or ID",
-  "token.tokenbook": "token address-book (add/list/remove)",
-  "tx.send": "transfer native / token",
-  "tx.sign": "sign transaction artifacts without broadcasting",
-  "tx.broadcast": "broadcast a presigned transaction",
-  "tx.multisig.local": "inspect and append local multi-sign approvals",
-  "tx.multisig.tronlink": "coordinate multi-sign approvals through TronLink",
-  "message.sign": "sign a message",
-  "contract.call": "constant + state-changing contract calls",
-  "contract.deploy": "deploy a smart contract",
-  "contract.governance": "govern a deployed smart contract",
-  "contract.create2": "compute TVM CREATE2 addresses",
-  "proposal.read": "query governance proposals",
-  "proposal.write": "create, approve, and delete governance proposals",
-  "witness.manage": "register and operate an SR candidacy",
-  "staking.freeze": "freeze/unfreeze (Stake 2.0)",
-  "staking.delegate": "delegate/undelegate resource (Stake 2.0)",
-  "vote.cast": "cast/replace SR votes",
-  "vote.list": "list super representatives",
-  "vote.status": "current SR votes and voting power",
-  "reward.balance": "claimable voting/block reward",
-  "reward.withdraw": "withdraw voting/block rewards",
-  "permission.read": "read account multi-sign permissions",
-  "permission.update": "replace account multi-sign permissions",
-  "gasfree.info": "GasFree account, fee and nonce information",
-  "gasfree.transfer": "TIP-712 gas-free token transfer",
-  "gasfree.trace": "track a GasFree transfer",
-};
-
 export const BUILTIN_NETWORKS: Record<string, NetworkDescriptor> = {
-  "tron:mainnet": {
-    id: "tron:mainnet",
+  "tron:728126428": {
+    id: "tron:728126428",
+    nativeSymbol: "TRX",
     family: "tron",
-    chainId: "mainnet",
-    aliases: ["tron"],
+    chainId: "728126428",
     httpEndpoint: "https://api.trongrid.io",
     tronlinkHttpEndpoint: "https://api.walletadapter.org",
     gasfree: {
@@ -62,14 +14,25 @@ export const BUILTIN_NETWORKS: Record<string, NetworkDescriptor> = {
       controllerChainId: "728126428",
       verifyingContract: "TFFAMQLZybALaLb4uxHA9RBE7pxhUAjF3U",
     },
+    sunswap: {
+      marketApiBaseUrl: "https://open.sun.io",
+      routerApiBaseUrl: "https://open.sun.io/apiv2/quote/swap",
+      liquidity: true,
+    },
+    sunpump: {
+      curve: true,
+      // Omitting the endpoint would let the SDK fall back to mainnet tokens.
+      apiBaseUrl: "https://api-v2.sunpump.meme/pump-api",
+    },
     feeModel: "tron-resource",
     capabilities: [],
   },
-  "tron:nile": {
-    id: "tron:nile",
+  "tron:3448148188": {
+    id: "tron:3448148188",
+    testnet: true,
+    nativeSymbol: "TRX",
     family: "tron",
-    chainId: "nile",
-    aliases: ["nile"],
+    chainId: "3448148188",
     httpEndpoint: "https://nile.trongrid.io",
     tronlinkHttpEndpoint: "https://apinile.walletadapter.org",
     gasfree: {
@@ -78,24 +41,93 @@ export const BUILTIN_NETWORKS: Record<string, NetworkDescriptor> = {
       controllerChainId: "3448148188",
       verifyingContract: "THQGuFzL87ZqhxkgqYEryRAd7gqFqL5rdc",
     },
+    // The market API serves mainnet data; Nile enables only contract-backed liquidity.
+    sunswap: { liquidity: true },
     feeModel: "tron-resource",
     capabilities: [],
   },
-  "tron:shasta": {
-    id: "tron:shasta",
+  "tron:2494104990": {
+    id: "tron:2494104990",
+    testnet: true,
+    nativeSymbol: "TRX",
     family: "tron",
-    chainId: "shasta",
-    aliases: ["shasta"],
+    chainId: "2494104990",
     httpEndpoint: "https://api.shasta.trongrid.io",
     tronlinkHttpEndpoint: "https://apishasta.walletadapter.org",
     feeModel: "tron-resource",
     capabilities: [],
   },
+  "eip155:1": {
+    id: "eip155:1",
+    nativeSymbol: "ETH",
+    family: "evm",
+    chainId: "1",
+    httpEndpoint: "https://ethereum-rpc.publicnode.com",
+    feeModel: "evm-gas",
+    capabilities: [],
+  },
+  "eip155:11155111": {
+    id: "eip155:11155111",
+    testnet: true,
+    nativeSymbol: "ETH",
+    family: "evm",
+    chainId: "11155111",
+    httpEndpoint: "https://ethereum-sepolia-rpc.publicnode.com",
+    feeModel: "evm-gas",
+    capabilities: [],
+  },
+  "eip155:56": {
+    id: "eip155:56",
+    nativeSymbol: "BNB",
+    family: "evm",
+    chainId: "56",
+    httpEndpoint: "https://bsc-dataseed.bnbchain.org",
+    feeModel: "evm-gas",
+    capabilities: [],
+  },
+  "eip155:97": {
+    id: "eip155:97",
+    testnet: true,
+    nativeSymbol: "BNB",
+    family: "evm",
+    chainId: "97",
+    httpEndpoint: "https://bsc-testnet-dataseed.bnbchain.org",
+    feeModel: "evm-gas",
+    capabilities: [],
+  },
+  "eip155:8453": {
+    id: "eip155:8453",
+    nativeSymbol: "ETH",
+    family: "evm",
+    chainId: "8453",
+    httpEndpoint: "https://mainnet.base.org",
+    feeModel: "evm-gas",
+    capabilities: [],
+  },
+  "eip155:84532": {
+    id: "eip155:84532",
+    nativeSymbol: "ETH",
+    family: "evm",
+    chainId: "84532",
+    httpEndpoint: "https://sepolia.base.org",
+    feeModel: "evm-gas",
+    capabilities: [],
+    testnet: true,
+  },
 };
 
-export const DEFAULT_CONFIG = {
-  defaultNetwork: "tron:mainnet",
-  defaultOutput: "text" as const,
-  timeoutMs: 60000,
-  waitTimeoutMs: 60000,
+// Put each short name first: listings display the first alias pointing to an id.
+export const BUILTIN_ALIASES: Record<string, string> = {
+  tron: "tron:728126428",
+  "tron:mainnet": "tron:728126428",
+  nile: "tron:3448148188",
+  "tron:nile": "tron:3448148188",
+  shasta: "tron:2494104990",
+  "tron:shasta": "tron:2494104990",
+  ethereum: "eip155:1",
+  sepolia: "eip155:11155111",
+  bsc: "eip155:56",
+  "bsc-testnet": "eip155:97",
+  base: "eip155:8453",
+  "base-sepolia": "eip155:84532",
 };
